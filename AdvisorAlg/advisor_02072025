@@ -1,92 +1,31 @@
 # %% Import
 
 
-#make this a tester for checking
-
 import os
 import time
 from enum import Enum
 import pandas as pd
 import numpy as np
-import pyomo.environ as pyo
-
-from pyomo.common.fileutils import this_file_dir
-from pyomo.common.collections import ComponentSet, ComponentMap
-from pyomo.util.calc_var_value import calculate_variable_from_constraint
-# import idaes
-# import idaes.core.util.scaling as iscale
 from pyomo.dae import ContinuousSet, DerivativeVar
-# from idaes.core.solvers import petsc
-# import idaes.logger as idaeslog
-# import idaes.core.util.model_serializer as ms
-
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
-
 from pyomo.dae.flatten import flatten_dae_components
 from scipy.io import loadmat
-
 import random
 import copy as copy
 import torch
 import torch.nn as nn
 import math
-from matplotlib import pyplot as plt
 from torch.utils.data import TensorDataset, DataLoader
 import pickle
 #################################################################################
 from matplotlib.font_manager import FontProperties
-import numpy as np
 from numpy import random as rand
-from matplotlib import pyplot as plt
-import copy as copy
-
-
-import numpy as np
-from matplotlib import pyplot as plt
-from torch.utils.data import TensorDataset, DataLoader
-# from idaes.core.util.model_statistics import degrees_of_freedom
 from pyomo.environ import *
 from pyomo.environ import SolverFactory
 from pyomo.dae import *
 from pyomo.dae.simulator import Simulator
-from idaes.core import FlowsheetBlock
-import idaes.logger as idaeslog
-import copy as copy
-import os
-import time
-from enum import Enum
-import pandas as pd
-import numpy as np
-import pyomo.environ as pyo
-# from pyomo.repn.plugins import nl_writer
-# nl_writer._activate_nl_writer_version(2)
-from pyomo.common.fileutils import this_file_dir
-from pyomo.common.collections import ComponentSet, ComponentMap
-from pyomo.util.calc_var_value import calculate_variable_from_constraint
-# import idaes
-# import idaes.core.util.scaling as iscale
-from pyomo.dae import ContinuousSet, DerivativeVar
-from idaes.core.solvers import petsc
-import idaes.logger as idaeslog
-import idaes.core.util.model_serializer as ms
-
-
-import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
-from idaes.models.control.controller import ControllerType, ControllerMVBoundType, ControllerAntiwindupType
-
-from idaes.models.properties import iapws95
-
-from pyomo.dae.flatten import flatten_dae_components
-from scipy.io import loadmat
-import random
-import copy as copy
-
-
-from matplotlib import pyplot as plt
-from torch.utils.data import TensorDataset, DataLoader
-import pickle
 from sklearn import mixture
 
 # %% RL functions
@@ -153,7 +92,11 @@ def create_scales_tanh(lbs,ubs):   #Scale variables -1 to 1
     return h
 
 
-class Buffer:    #standard buffer for actor-critc RL semi batch udpate
+class Buffer:  
+    '''
+    Standard buffer for actor-critc RL
+    semi batch update
+    '''
     def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
         # Number of "experiences" to store at max
         self.buffer_capacity = buffer_capacity
@@ -246,7 +189,8 @@ class Buffer:    #standard buffer for actor-critc RL semi batch udpate
 
 
 
-class policy(nn.Module):   #pytorch policy structure
+class policy(nn.Module): 
+    '''pytorch policy structure'''
     def __init__(self,n_states,n_actions):
         super(policy, self).__init__()
         
@@ -276,7 +220,8 @@ class policy(nn.Module):   #pytorch policy structure
         y=self.stack(x)
         return y
          
-class Qfun(nn.Module):   #pytorch critic structure
+class Qfun(nn.Module):   
+    '''pytorch critic structure'''
     def __init__(self, n_states, n_actions):
         super(Qfun,self).__init__()
         
@@ -330,7 +275,10 @@ class Qfun(nn.Module):   #pytorch critic structure
         out=self.stack3(z)
         return out
 
-class DDPGagent:  #Deep determinsitic policy gradient
+class DDPGagent:  
+    '''
+    Deep determinsitic policy gradient 
+    '''
     def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
         # Params
         self.num_states = n_states
@@ -361,7 +309,6 @@ class DDPGagent:  #Deep determinsitic policy gradient
         self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
         self.critic_opt= torch.optim.Adam(self.critic.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
     
-        self.gmm=mixer()
 
     def get_action(self, state):
         state = torch.tensor([state]).float()
@@ -408,7 +355,10 @@ class DDPGagent:  #Deep determinsitic policy gradient
             target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
 
 
-class TD3:   #twin delayed deterministic policy gradient
+class TD3:  
+    '''
+    twin delayed deterministic policy gradient
+    '''
     def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0, p=2):
         # Params
         self.num_states = n_states
@@ -517,7 +467,10 @@ class TD3:   #twin delayed deterministic policy gradient
         # update target networks 
  
 
-class OUActionNoise:   #ornstein uhlenbock process for exploration nosie
+class OUActionNoise: 
+    '''
+    ornstein uhlenbock process for exploration noise
+    '''
     def __init__(self, mean, sigma_max=.35, sigma_min=0, theta=0.15, dt=1, decay_period=1e4, x_initial=None):
         self.theta = theta
         self.mean = mean
@@ -842,7 +795,7 @@ class DDPGagent_m:   #modified ddpg for gmm process
             target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
 
 
-def H_eR(prb,tempR):
+def H_eR(prb,tempR): #Calculate expected reward and entropy for probabilty
     H=0
     R=0
     for grp,s in enumerate(prb):
@@ -855,7 +808,7 @@ def H_eR(prb,tempR):
     return H,R
 
 
-def H_eR_(prb,tempR):
+def H_eR_(prb,tempR):  #Calculate  entropy for probabilty
     H=0
     R=0
     for grp,s in enumerate(prb):
@@ -1280,8 +1233,8 @@ class Buffer3:   #modifed buffer version 3
 
 
 
-# Choose Update for reard
-class DDPGagent_m2:   #ddpg version 3 modified for gmm update and exp
+
+class DDPGagent_m2:   #ddpg version 3 modified for gmm update and exploration
     def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
         # Params
         self.num_states = n_states
@@ -1597,7 +1550,7 @@ import numpy as np
 from matplotlib import pyplot as plt
 import pickle
 
-def loss_plot(pfile_L):
+def loss_plot(pfile_L):    #Print current loss in training
     with open(pfile_L, "rb") as pkl_rb_obj:
         Loss = pickle.load(pkl_rb_obj)  
     # Loss=np.array(t1.rbfL)
