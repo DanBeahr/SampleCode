@@ -1851,37 +1851,37 @@ Agent=DDPGagent_m2(n_states,n_actions, 1e-4, 1e-3, 0.99, 0.01, 100000, bs, wd)  
 # %% Settings
 
 special_train=False
-special_exp=True
+special_exp=False
 
 #Train
-# epmax=100
-# tfinal=30
-# # noise=0.01 ##########################
-# noise=0.25 ##########################
-# # noise=0.32 ##########################
-# static_nn=False
-# save_nn=True   ###############################################
-# dist_select=False
-# decay_dist_select=False
-# decay_B=False
-# switch_B=False
-# save_loss=True   ###############################################
+epmax=500
+tfinal=30
+# noise=0.01 ##########################
+noise=0.25 ##########################
+# noise=0.32 ##########################
+static_nn=False
+save_nn=False   ###############################################
+dist_select=False
+decay_dist_select=False
+decay_B=False
+switch_B=False
+save_loss=False   ###############################################
 
 
 
 #Test
-epmax=10
-tfinal=30
-noise=0
-static_nn=True    #not training NN model or updating OMLT
-save_nn=False      #save NN
-dist_select=True   #use select disturbances
-decay_dist_select=False
-decay_B=False
-switch_B=False
-save_loss=False
-special_train=False
-special_exp=False
+# epmax=10
+# tfinal=30
+# noise=0
+# static_nn=True    #not training NN model or updating OMLT
+# save_nn=False      #save NN
+# dist_select=True   #use select disturbances
+# decay_dist_select=False
+# decay_B=False
+# switch_B=False
+# save_loss=False
+# special_train=False
+# special_exp=False
 
 
 
