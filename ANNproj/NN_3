@@ -161,7 +161,9 @@ class nn:
 # x_train = np.array([[0,0], [0,1], [1,0], [1,1]]).T
 # y_train = np.array([[0], [1], [1], [0]]).T
 # %%
-pth=(r"G:\My Drive\Python Scripts\Class\Project3 NN\NN_proj_data_04.mat")
+pth=(r"G:\My Drive\gittest\Sample\ANNproj\NN_proj_data_04.mat")
+
+
 
 Data=loadmat(pth)
 inp=Data['inp_train']
