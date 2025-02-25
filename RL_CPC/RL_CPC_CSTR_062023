@@ -1021,7 +1021,7 @@ def regress(x,y):
 
 # (1,100)
 
-class beta4:
+class beta4:   #Latest Version
     def __init__(self, scls, betastart=0, cap=60, capL=60, phi=60, phi2=60, Timer=60, TimerL=300, ds=1, step=0.02, rlb_tol=0.025, cooldown=1, baseerror=0.02, bounds=[0.3,0.7]):
         self.clock=[]
         self.b0=betastart
