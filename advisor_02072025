@@ -13,12 +13,12 @@ import pyomo.environ as pyo
 from pyomo.common.fileutils import this_file_dir
 from pyomo.common.collections import ComponentSet, ComponentMap
 from pyomo.util.calc_var_value import calculate_variable_from_constraint
-import idaes
-import idaes.core.util.scaling as iscale
+# import idaes
+# import idaes.core.util.scaling as iscale
 from pyomo.dae import ContinuousSet, DerivativeVar
-from idaes.core.solvers import petsc
-import idaes.logger as idaeslog
-import idaes.core.util.model_serializer as ms
+# from idaes.core.solvers import petsc
+# import idaes.logger as idaeslog
+# import idaes.core.util.model_serializer as ms
 
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
@@ -45,7 +45,7 @@ import copy as copy
 import numpy as np
 from matplotlib import pyplot as plt
 from torch.utils.data import TensorDataset, DataLoader
-from idaes.core.util.model_statistics import degrees_of_freedom
+# from idaes.core.util.model_statistics import degrees_of_freedom
 from pyomo.environ import *
 from pyomo.environ import SolverFactory
 from pyomo.dae import *
@@ -64,8 +64,8 @@ import pyomo.environ as pyo
 from pyomo.common.fileutils import this_file_dir
 from pyomo.common.collections import ComponentSet, ComponentMap
 from pyomo.util.calc_var_value import calculate_variable_from_constraint
-import idaes
-import idaes.core.util.scaling as iscale
+# import idaes
+# import idaes.core.util.scaling as iscale
 from pyomo.dae import ContinuousSet, DerivativeVar
 from idaes.core.solvers import petsc
 import idaes.logger as idaeslog
@@ -92,7 +92,7 @@ from sklearn import mixture
 # %% RL functions
 
 
-def mov_med(rcat,mds_=60*3):
+def mov_med(rcat,mds_=60*3): #Calculate moving median
     ccc=[]
     mds=mds_
     for i in range(len(rcat)):
@@ -102,7 +102,7 @@ def mov_med(rcat,mds_=60*3):
             ccc.append(np.median(rcat[i-mds:i]))
     return ccc
 
-def mov_mean(rcat,mds_=60*3):
+def mov_mean(rcat,mds_=60*3): #Calculate moving mean
     ccc=[]
     mds=mds_
     for i in range(len(rcat)):
@@ -111,8 +111,6 @@ def mov_mean(rcat,mds_=60*3):
         else:
             ccc.append(np.mean(rcat[i-mds:i]))
     return ccc
-
-
 
 class scale_fun_htan:
     def __init__(self,low,high):
@@ -142,20 +140,20 @@ class scale_fun_sig:
         anorm=(aact-self.ba)/self.ka
         return anorm
 
-def create_scales_sig(lbs,ubs):
+def create_scales_sig(lbs,ubs):   #Scale variables 0 to 1
     h=[]
     for i in range(len(lbs)):
         h.append(scale_fun_sig(lbs[i],ubs[i]))
     return h
 
-def create_scales_tanh(lbs,ubs):
+def create_scales_tanh(lbs,ubs):   #Scale variables -1 to 1
     h=[]
     for i in range(len(lbs)):
         h.append(scale_fun_htan(lbs[i],ubs[i]))
     return h
 
 
-class Buffer:
+class Buffer:    #standard buffer for actor-critc RL semi batch udpate
     def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
         # Number of "experiences" to store at max
         self.buffer_capacity = buffer_capacity
@@ -165,8 +163,7 @@ class Buffer:
         # Its tells us num of times record() was called.
         self.buffer_counter = 0
 
-        # Instead of list of tuples as the exp.replay concept go
-        # We use different np.arrays for each tuple element
+        
         self.state_buffer = []
         self.action_buffer = []
         self.reward_buffer = []
@@ -225,7 +222,7 @@ class Buffer:
                 next_states.append(self.next_state_buffer[i])
         return states, actions, rewards, next_states
     
-    def get_batch1_2(self):
+    def get_batch1_2(self):  #modified buffer batch retirval
         states=[]
         actions=[]
         rewards=[]
@@ -249,7 +246,7 @@ class Buffer:
 
 
 
-class policy(nn.Module):
+class policy(nn.Module):   #pytorch policy structure
     def __init__(self,n_states,n_actions):
         super(policy, self).__init__()
         
@@ -278,8 +275,8 @@ class policy(nn.Module):
     def forward(self,x):
         y=self.stack(x)
         return y
-        
-class Qfun(nn.Module):
+         
+class Qfun(nn.Module):   #pytorch critic structure
     def __init__(self, n_states, n_actions):
         super(Qfun,self).__init__()
         
@@ -333,7 +330,7 @@ class Qfun(nn.Module):
         out=self.stack3(z)
         return out
 
-class DDPGagent:
+class DDPGagent:  #Deep determinsitic policy gradient
     def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
         # Params
         self.num_states = n_states
@@ -411,7 +408,7 @@ class DDPGagent:
             target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
 
 
-class TD3:
+class TD3:   #twin delayed deterministic policy gradient
     def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0, p=2):
         # Params
         self.num_states = n_states
@@ -520,7 +517,7 @@ class TD3:
         # update target networks 
  
 
-class OUActionNoise:
+class OUActionNoise:   #ornstein uhlenbock process for exploration nosie
     def __init__(self, mean, sigma_max=.35, sigma_min=0, theta=0.15, dt=1, decay_period=1e4, x_initial=None):
         self.theta = theta
         self.mean = mean
@@ -555,7 +552,7 @@ class OUActionNoise:
             self.x_prev = np.zeros_like(self.mean)
 
 
-class mixer:
+class mixer:    #dont use
     def __init__(self):
         # Agent=agent_
         self.clf=[]
@@ -621,7 +618,7 @@ class mixer:
 
 
 
-class Buffer2:
+class Buffer2:   #modified buffer for gmm update and exp
     def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
         # Number of "experiences" to store at max
         self.buffer_capacity = buffer_capacity
@@ -787,7 +784,7 @@ class Buffer2:
 
 
 # choose update based on proximity
-class DDPGagent_m:
+class DDPGagent_m:   #modified ddpg for gmm process
     def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
         # Params
         self.num_states = n_states
@@ -931,7 +928,7 @@ def H_eR_(prb,tempR):
                 H=H-s*np.log2(s)
     return H,R
 
-class Buffer3:
+class Buffer3:   #modifed buffer version 3
     def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
         # Number of "experiences" to store at max
         self.buffer_capacity = buffer_capacity
@@ -1210,36 +1207,6 @@ class Buffer3:
 
 
 
-# K=[]
-# Entropy=[]
-# ExpR=[]
-# B1=GnR.predict_proba(data2)
-# for i in B1:
-#     # print(i.shape)
-#     # print(np.max(i))
-#     k2=np.max(i)
-
-#     H=0
-#     R_=0
-#     for grp,s in enumerate(i):
-        
-#         R_=R_+s*tempR[grp][1]
-#         if s <1e-6:
-#             H=H+0
-#         else:
-#             H=H-s*np.log2(s)
-#     Entropy.append(H)
-#     ExpR.append(R_)
-#     # B1.shape
-#     # np.append(K,kkk)
-#     K.append(k2)
-
-# test=np.concatenate((data2,np.array([ExpR]).T),1)
-# # plt.hist(K)
-# # plt.hist(Entropy)
-
-# out=GR.predict(test)
-# outT=GR.predict(data3)
 
         # thresh=0.9
 
@@ -1375,7 +1342,7 @@ class Buffer3:
 
 
 # Choose Update for reard
-class DDPGagent_m2:
+class DDPGagent_m2:   #ddpg version 3 modified for gmm update and exp
     def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
         # Params
         self.num_states = n_states
@@ -1572,72 +1539,11 @@ class DDPGagent_m2:
 #             action=[]
 #         return nva, action
 
-# %% vfmpc buffer
 
-class vf_Buffer3:
-    def __init__(self, buffer_capacity=1000, batch_size=10):
-        # Number of "experiences" to store at max
-        self.buffer_capacity = buffer_capacity
-        # Num of tuples to train on.
-        self.batch_size = batch_size
-
-        # Its tells us num of times record() was called.
-        self.buffer_counter = 0
-
-        self.buffer=[]
-        
-
-    # Takes (s,a,r,s') obervation tuple as input
-    def record(self, obs_tuple):
-        # Set index to zero if buffer_capacity is exceeded,
-        # replacing old records
-
-        if len(self.buffer)>=self.buffer_capacity:
-            self.buffer.pop(0)
-        self.buffer.append(obs_tuple)
-        
-        # index = self.buffer_counter % self.buffer_capacity
-        self.buffer_counter += 1
-        
-    def get_batch(self):
-        
-
-        # p=[zvals,rt,Gt,zprime]
-        
-
-        if self.buffer_counter < self.batch_size:
-            NN=self.buffer_counter
-            for k,i in enumerate(self.buffer):
-                if k==0:
-                    R_star_c=i[0]
-                    z_c=i[1]
-                    R_c=i[2]
-                    
-                else:
-                    R_star_c=torch.cat((R_star_c,i[0]),0)
-                    z_c=torch.cat((z_c,i[1]),0)
-                    R_c=torch.cat((R_c,i[2]),0)
-                    
-        else:
-            select=random.sample(range(len(self.buffer)),self.batch_size)
-            R_star_c=self.buffer[select[0]][0]
-            z_c=self.buffer[select[0]][1]
-            R_c=self.buffer[select[0]][2]
-            
-            for i in select[1:]:
-                R_star_c=torch.cat((R_star_c,self.buffer[i][0]),0)
-                z_c=torch.cat((z_c,self.buffer[i][1]),0)
-                R_c=torch.cat((R_c,self.buffer[i][2]),0)
-            
-            NN=len(select)
-        return R_star_c, z_c, R_c, NN
-
-
-# %% SCR
 
 
 # %% SCR unit
-class SCR:
+class SCR:   #selective catalytric reduction unit (linear and nonlinear state space model)
     def __init__(self,du_sc=None,u_sc=None,y_sc=None):
         self.h = 0.1
         self.A = np.array([[0.9464,0.0056],
@@ -1784,134 +1690,14 @@ class SCR:
 
 #  %% Path
 
-# G:\My Drive\Python Scripts\conf_set\glocal1
 
-# print('G LOCAL 1')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal1')
+
+# print('G LOCAL 13')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal13')
 # path_c1_s=(pbse+'\critic1')
 # path_ct1_s=(pbse+'\critic_target1')
 # path_a_s=(pbse+r'\actor')
 # path_at_s=(pbse+r'\actor_target')
-
-# test if rewaard does better
-# print('G LOCAL 2')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal2')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-# standard vs reward
-# print('G LOCAL 2_2')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal2_2')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-# tau 0.01 Best
-# print('G LOCAL 3')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal3')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-# Load buffer in best
-# print('G LOCAL 4')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal4')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-# load buffer standard
-# print('G LOCAL 4_2')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal4_2')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-
-
-# special train 500 episodes
-# print('G LOCAL 5')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal5')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-
-# special train standard
-# print('G LOCAL 6')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal6')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-# special explore
-# print('G LOCAL 7')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal7')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-
-
-# %%
-
-# Standard
-# print('G LOCAL 8')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal8')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-# Reward focus update
-# print('G LOCAL 9')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal9')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-# exploration focus
-# print('G LOCAL 10')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal10')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-# Use both
-# print('G LOCAL 11')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal1')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-
-# %%
-# print('G LOCAL 12')
-# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal12')
-# path_c1_s=(pbse+'\critic1')
-# path_ct1_s=(pbse+'\critic_target1')
-# path_a_s=(pbse+r'\actor')
-# path_at_s=(pbse+r'\actor_target')
-
-
-print('G LOCAL 13')
-pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal13')
-path_c1_s=(pbse+'\critic1')
-path_ct1_s=(pbse+'\critic_target1')
-path_a_s=(pbse+r'\actor')
-path_at_s=(pbse+r'\actor_target')
 
 
 # %% spec opt
@@ -1919,25 +1705,7 @@ path_at_s=(pbse+r'\actor_target')
 # cat_=t1.cat.buffer
 
 
-def mov_med(rcat,mds_=60*3):
-    ccc=[]
-    mds=mds_
-    for i in range(len(rcat)):
-        if i<mds:
-            ccc.append(np.median(rcat[0:i+1]))
-        else:
-            ccc.append(np.median(rcat[i-mds:i]))
-    return ccc
 
-def mov_mean(rcat,mds_=60*3):
-    ccc=[]
-    mds=mds_
-    for i in range(len(rcat)):
-        if i<mds:
-            ccc.append(np.mean(rcat[0:i+1]))
-        else:
-            ccc.append(np.mean(rcat[i-mds:i]))
-    return ccc
 
 
 
@@ -2018,7 +1786,7 @@ def loss_plot(pfile_L):
 # %% Initialize
 
 
-#Double Int
+#Double Int   (initalization  for double integrator model)
 # dulb=[-5]
 # duub=[5]
 # ulb=[-10]
@@ -2036,7 +1804,7 @@ def loss_plot(pfile_L):
 # # ss.Q=np.eye(2)
 
 
-#SCR
+#SCR   (initalization  for double integrator model)
 dulb=[-100]
 duub=[100]
 ulb=[-400]
@@ -2182,7 +1950,7 @@ OUA=OUActionNoise(np.array(0),sigma_max=noise, sigma_min=0.0, theta=0.15, dt=1, 
 # Agent.critic_target= torch.load(path_ct1_s)
 
 
-# %%
+# %%   Sample disturbances for testing
 
 dist_scr=[np.array([[0.62053369],
         [1.22600576]]),
@@ -2501,38 +2269,10 @@ for ep in range(epmax):
                 unew=Agent.get_action( [y_sc[0].norm(y[0].item()),y_sc[0].norm(y[1].item())] )
                 nva=True
 
-            # print(unew)
-
-            # try:
-                
-                # print('RL')
-                
-                # ytraj,unew,xtraj,J,G=t1.RL_rbf(x.squeeze(axis=1).tolist(),u.squeeze(axis=1).tolist(),0)
-                # unew=Agent.get_action( [y_sc[0].norm(y[0].item()),y_sc[0].norm(y[1].item())] )
-                # unew=Agent.get_action(y_sc[0].norm(y.item()))
-
-##############################################################################################################
-##############################################################################################################
-
-            # except:
-            #     try:
-            #         breaktimes_act.append([ep,t])
-            #         print('-------------------------------f----------------------------------')
-            #         ytraj,unew,xtraj,J,G=t1.static(x.squeeze(axis=1).tolist(),u.squeeze(axis=1).tolist(),0)
-            #     except:
-            #         print('-------------------------------ff----------------------------------')
-            #         BKC+=1
-            #         unew[0][0]=0
+            
         else:
-            # try:
-            #     if nlmodel:
-            #         ytraj,unew,xtraj,J,G=t1.static_nl(x.squeeze(axis=1).tolist(),u.squeeze(axis=1).tolist(),0)
-            #     else:
-            #         ytraj,unew,xtraj,J,G=t1.static(x.squeeze(axis=1).tolist(),u.squeeze(axis=1).tolist(),0)
-            # except:
-            #     unew[0][0]=0
-                # print('-------------------------------f----------------------------------')
-            print('-------------------------------f----------------------------------')
+           
+            print('-------------------------------check----------------------------------')
         
         ucat_n.append(unew)
         # xtraj_cat.append(xtraj)
@@ -2736,7 +2476,7 @@ buffile=np.concatenate((sb,ab,rb,ssb),1)
 # nam_con="ep_500_01212025_standard_10grp"
 # nam_con="ep_500_01212025_reward_10grp"
 # nam_con="ep_500_01212025_explore_10grp"
-nam_con="ep_500_01212025_both_10grp"
+# nam_con="ep_500_01212025_both_10grp"
 
 
 datfile=[xcat, ycat, ucat, rcat, rvg_cat, loss1,loss2]
@@ -2757,7 +2497,7 @@ if save_data:
 
 
 
-# %%nopenbuffer
+# %%Open buffer for load data testing
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -2766,13 +2506,13 @@ from matplotlib.colors import LogNorm
 from sklearn import mixture
 
 # nam_con="ep_100_12202024_siso"
-nam_con="ep_1000_12202024_siso"
-pfile=(r"G:\My Drive\Python Scripts\conf_set\data\buffile_"+nam_con+".pkl")
-with open(pfile, "rb") as pkl_rb_obj:
-        buffile = pickle.load(pkl_rb_obj)  
+# nam_con="ep_1000_12202024_siso"
+# pfile=(r"G:\My Drive\Python Scripts\conf_set\data\buffile_"+nam_con+".pkl")
+# with open(pfile, "rb") as pkl_rb_obj:
+#         buffile = pickle.load(pkl_rb_obj)  
 
 
-data=buffile
+# data=buffile
 
 # sb=Agent.RB.state_buffer
 # ab=Agent.RB.action_buffer
@@ -2789,7 +2529,8 @@ data=buffile
 # data=np.concatenate((sb2,ab2,rb2,ssb2),1)
 # # data=np.concatenate((sb2,ab2,rb2),1)
 
-# %%
+# %% sample from training
+
 # data2=data[:,0:3]
 # clf = mixture.GaussianMixture(n_components=9, covariance_type="full")
 # clf.fit(data2)
@@ -2860,7 +2601,7 @@ for i,k in enumerate(tempa):
 # X, Y, R = np.meshgrid(x, y, r)
 del GR
 del GnR
-# %% Start Here
+# %% Start Here for test plotting
 nc=8
 end=12000
 data=Agent.RB.data
@@ -2875,7 +2616,7 @@ GR=mixture.BayesianGaussianMixture(n_components=6, covariance_type="tied", max_i
 GR.fit(data3)
 # full tied speherical diag
 
-# %%
+# %%  Start Here for test plotting of trained data
 data=Agent.RB.data
 data2=Agent.RB.data[:,0:3] #no rewards
 data2_full=Agent.RB.data[:,0:3] #no rewards
