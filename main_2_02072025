@@ -1,0 +1,3200 @@
+# %% Import
+
+import os
+import time
+from enum import Enum
+import pandas as pd
+import numpy as np
+import pyomo.environ as pyo
+
+from pyomo.common.fileutils import this_file_dir
+from pyomo.common.collections import ComponentSet, ComponentMap
+from pyomo.util.calc_var_value import calculate_variable_from_constraint
+import idaes
+import idaes.core.util.scaling as iscale
+from pyomo.dae import ContinuousSet, DerivativeVar
+from idaes.core.solvers import petsc
+import idaes.logger as idaeslog
+import idaes.core.util.model_serializer as ms
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+
+from pyomo.dae.flatten import flatten_dae_components
+from scipy.io import loadmat
+
+import random
+import copy as copy
+import torch
+import torch.nn as nn
+import math
+from matplotlib import pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader
+import pickle
+#################################################################################
+from matplotlib.font_manager import FontProperties
+import numpy as np
+from numpy import random as rand
+from matplotlib import pyplot as plt
+import copy as copy
+
+
+import numpy as np
+from matplotlib import pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader
+from idaes.core.util.model_statistics import degrees_of_freedom
+from pyomo.environ import *
+from pyomo.environ import SolverFactory
+from pyomo.dae import *
+from pyomo.dae.simulator import Simulator
+from idaes.core import FlowsheetBlock
+import idaes.logger as idaeslog
+import copy as copy
+import os
+import time
+from enum import Enum
+import pandas as pd
+import numpy as np
+import pyomo.environ as pyo
+# from pyomo.repn.plugins import nl_writer
+# nl_writer._activate_nl_writer_version(2)
+from pyomo.common.fileutils import this_file_dir
+from pyomo.common.collections import ComponentSet, ComponentMap
+from pyomo.util.calc_var_value import calculate_variable_from_constraint
+import idaes
+import idaes.core.util.scaling as iscale
+from pyomo.dae import ContinuousSet, DerivativeVar
+from idaes.core.solvers import petsc
+import idaes.logger as idaeslog
+import idaes.core.util.model_serializer as ms
+
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+from idaes.models.control.controller import ControllerType, ControllerMVBoundType, ControllerAntiwindupType
+
+from idaes.models.properties import iapws95
+
+from pyomo.dae.flatten import flatten_dae_components
+from scipy.io import loadmat
+import random
+import copy as copy
+
+
+from matplotlib import pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader
+import pickle
+from sklearn import mixture
+
+# %% RL functions
+
+
+def mov_med(rcat,mds_=60*3):
+    ccc=[]
+    mds=mds_
+    for i in range(len(rcat)):
+        if i<mds:
+            ccc.append(np.median(rcat[0:i+1]))
+        else:
+            ccc.append(np.median(rcat[i-mds:i]))
+    return ccc
+
+def mov_mean(rcat,mds_=60*3):
+    ccc=[]
+    mds=mds_
+    for i in range(len(rcat)):
+        if i<mds:
+            ccc.append(np.mean(rcat[0:i+1]))
+        else:
+            ccc.append(np.mean(rcat[i-mds:i]))
+    return ccc
+
+
+
+class scale_fun_htan:
+    def __init__(self,low,high):
+        self.high=high
+        self.low=low
+
+        self.ka=(self.high-self.low)/2
+        self.ba=(self.high+self.low)/2
+    def act(self, anorm):
+        aact=self.ka*anorm+self.ba
+        return aact    
+    def norm(self, aact):
+        anorm=(aact-self.ba)/self.ka
+        return anorm
+    
+class scale_fun_sig:
+    def __init__(self,low,high):
+        self.high=high
+        self.low=low
+
+        self.ka=(self.high-self.low)/1
+        self.ba=self.low
+    def act(self, anorm):
+        aact=self.ka*anorm+self.ba
+        return aact    
+    def norm(self, aact):
+        anorm=(aact-self.ba)/self.ka
+        return anorm
+
+def create_scales_sig(lbs,ubs):
+    h=[]
+    for i in range(len(lbs)):
+        h.append(scale_fun_sig(lbs[i],ubs[i]))
+    return h
+
+def create_scales_tanh(lbs,ubs):
+    h=[]
+    for i in range(len(lbs)):
+        h.append(scale_fun_htan(lbs[i],ubs[i]))
+    return h
+
+
+class Buffer:
+    def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
+        # Number of "experiences" to store at max
+        self.buffer_capacity = buffer_capacity
+        # Num of tuples to train on.
+        self.batch_size = batch_size
+
+        # Its tells us num of times record() was called.
+        self.buffer_counter = 0
+
+        # Instead of list of tuples as the exp.replay concept go
+        # We use different np.arrays for each tuple element
+        self.state_buffer = []
+        self.action_buffer = []
+        self.reward_buffer = []
+        self.next_state_buffer = []
+        self.on = 0
+        # self.state_buffer = np.zeros((self.buffer_capacity, n_states))
+        # self.action_buffer = np.zeros((self.buffer_capacity, n_actions))
+        # self.reward_buffer = np.zeros((self.buffer_capacity, 1))
+        # self.next_state_buffer = np.zeros((self.buffer_capacity, num_states))
+
+        self.state_buffer_s = []
+        self.action_buffer_s = []
+        self.reward_buffer_s = []
+        self.next_state_buffer_s = []
+
+    # Takes (s,a,r,s') obervation tuple as input
+    def record(self, obs_tuple):
+        # Set index to zero if buffer_capacity is exceeded,
+        # replacing old records
+        index = self.buffer_counter % self.buffer_capacity
+        
+        if self.buffer_counter > 0 and index==0:
+            self.on=1
+        if self.on==1:
+            self.state_buffer[index] = obs_tuple[0]
+            self.action_buffer[index] = obs_tuple[1]
+            self.reward_buffer[index] = obs_tuple[2]
+            self.next_state_buffer[index] = obs_tuple[3]
+        else:
+            self.state_buffer.append(obs_tuple[0])
+            self.action_buffer.append(obs_tuple[1])
+            self.reward_buffer.append(obs_tuple[2])
+            self.next_state_buffer.append(obs_tuple[3])
+
+        self.buffer_counter += 1
+        
+    def get_batch(self):
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if self.buffer_counter < self.batch_size:
+            states=self.state_buffer
+            actions=self.action_buffer
+            rewards=self.reward_buffer
+            next_states=self.next_state_buffer
+        else:
+            select=random.sample(range(len(self.state_buffer)),self.batch_size)
+            
+            for i in select:
+                states.append(self.state_buffer[i])
+                actions.append(self.action_buffer[i])
+                rewards.append(self.reward_buffer[i])
+                next_states.append(self.next_state_buffer[i])
+        return states, actions, rewards, next_states
+    
+    def get_batch1_2(self):
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if self.buffer_counter < self.batch_size/2:
+            states=self.state_buffer
+            actions=self.action_buffer
+            rewards=self.reward_buffer
+            next_states=self.next_state_buffer
+        else:
+            select=random.sample(range(len(self.state_buffer)),self.batch_size/2)
+            
+            for i in select:
+                states.append(self.state_buffer[i])
+                actions.append(self.action_buffer[i])
+                rewards.append(self.reward_buffer[i])
+                next_states.append(self.next_state_buffer[i])
+        return states, actions, rewards, next_states
+
+
+
+class policy(nn.Module):
+    def __init__(self,n_states,n_actions):
+        super(policy, self).__init__()
+        
+        self.stack=nn.Sequential(nn.Linear(n_states,100),
+                                    nn.ReLU(),
+                                    # nn.ReLU(),
+                                    # nn.ReLU(),
+                                      nn.Linear(100, 75),
+                                      nn.ReLU(),
+                                    nn.Linear(75,n_actions),
+                                    nn.Tanh()
+                                    # nn.Sigmoid()
+                                    )       
+        
+
+        # self.stack=nn.Sequential(nn.Linear(n_states,1280),
+        #                       nn.ReLU(),
+        #                       nn.Linear(1280, 128),
+        #                       nn.ReLU(),
+        #                       nn.Linear(128, 64),
+        #                       nn.ReLU(),
+        #                       nn.Linear(64,n_actions),
+        #                       nn.Tanh() #nn.Sigmoid()
+        #                       )       
+        
+    def forward(self,x):
+        y=self.stack(x)
+        return y
+        
+class Qfun(nn.Module):
+    def __init__(self, n_states, n_actions):
+        super(Qfun,self).__init__()
+        
+        self.stack1=nn.Sequential(nn.Linear(n_states,100),
+                              nn.ReLU(),
+                              nn.ReLU(),
+                            #   nn.Sigmoid(),
+                            #   nn.Linear(640, 128),
+                            #   nn.ReLU(),
+                              )
+        
+        
+        self.stack2=nn.Sequential(nn.Linear(n_actions,100),
+                              nn.ReLU(),
+                            #   nn.ReLU(),
+                            #   nn.Sigmoid(),
+                            #   nn.Linear(640, 128),
+                            #   nn.ReLU(),
+                              )
+        
+        self.stack3=nn.Sequential(nn.Linear(100*2, 100),
+                                  nn.ReLU(),
+                                  nn.ReLU(),
+                                  nn.Linear(100,1))
+        
+
+
+        # self.stack1=nn.Sequential(nn.Linear(n_states,640),
+        #                       nn.ReLU(),
+        #                       nn.Linear(640, 128),
+        #                       nn.ReLU(),
+        #                       )
+        
+        
+        # self.stack2=nn.Sequential(nn.Linear(n_actions,640),
+        #                       nn.ReLU(),
+        #                       nn.Linear(640, 128),
+        #                       nn.ReLU(),
+        #                       )
+        
+        # self.stack3=nn.Sequential(nn.Linear(128*2, 64),
+        #                           nn.ReLU(),
+        #                           nn.Linear(64,1))
+        
+    def forward(self,s,a):
+        s1=self.stack1(s)
+        a1=self.stack2(a)
+        z=torch.cat((s1,a1),len(s1.size())-1)
+        # z=torch.cat((s1,a1),1)
+        # z=torch.cat((s1,a1))
+        out=self.stack3(z)
+        return out
+
+class DDPGagent:
+    def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
+        # Params
+        self.num_states = n_states
+        self.num_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+
+        self.c_L=[]
+        self.p_L=[]
+        self.Qcat=[]
+
+
+        # Networks
+        self.actor = policy(self.num_states,self.num_actions)
+        self.actor_target = policy(self.num_states,self.num_actions)
+        self.critic = Qfun(self.num_states, self.num_actions)
+        self.critic_target = Qfun(self.num_states, self.num_actions)
+
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data)
+        
+        # Training
+        self.RB = Buffer(self.num_states,self.num_actions,buffer_capacity)        
+        self.critic_loss  = nn.MSELoss()
+        self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+        self.critic_opt= torch.optim.Adam(self.critic.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+    
+        self.gmm=mixer()
+
+    def get_action(self, state):
+        state = torch.tensor([state]).float()
+        action = self.actor.forward(state)
+        action = np.squeeze(action.detach().numpy())
+        # action=np.ndarray.item(action)
+        return action
+    
+    def update(self):
+        states, actions, rewards, next_states = self.RB.get_batch()
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+        # Critic loss        
+        Qvals = self.critic.forward(states, actions)
+        next_actions = self.actor_target.forward(next_states)
+        next_Q = self.critic_target.forward(next_states, next_actions.detach())
+        Qprime = rewards + self.gamma * next_Q
+        critic_loss = self.critic_loss(Qvals, Qprime)
+        self.c_L.append(critic_loss.detach().numpy())
+
+        self.Qcat.append(Qvals.mean().item())
+
+        # Actor loss
+        policy_loss = -self.critic.forward(states, self.actor.forward(states)).mean()
+        self.p_L.append(policy_loss.detach().numpy())
+
+        # update networks
+        self.actor_opt.zero_grad()
+        policy_loss.backward()
+        self.actor_opt.step()
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward() 
+        self.critic_opt.step()
+
+        # update target networks 
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+
+class TD3:
+    def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0, p=2):
+        # Params
+        self.num_states = n_states
+        self.num_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+
+        self.batch_size=batch_size
+
+        self.c_L1=[]
+        self.c_L2=[]
+        self.p_L=[]
+
+        self.m=0
+        self.p=p
+
+        # Networks
+        self.actor = policy(self.num_states,self.num_actions)
+        self.actor_target = policy(self.num_states,self.num_actions)
+        self.critic1 = Qfun(self.num_states, self.num_actions)
+        self.critic_target1 = Qfun(self.num_states, self.num_actions)
+        self.critic2 = Qfun(self.num_states, self.num_actions)
+        self.critic_target2 = Qfun(self.num_states, self.num_actions)
+
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target1.parameters(), self.critic1.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target2.parameters(), self.critic2.parameters()):
+            target_param.data.copy_(param.data)
+        
+        # Training
+        self.RB = Buffer(self.num_states,self.num_actions,buffer_capacity,batch_size)        
+        self.critic_loss1  = nn.MSELoss()
+        self.critic_loss2  = nn.MSELoss()
+        self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+        self.critic_opt1= torch.optim.Adam(self.critic1.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+        self.critic_opt2= torch.optim.Adam(self.critic2.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+
+    def get_action(self, state):
+        state = torch.tensor([state]).float()
+        action = self.actor.forward(state)
+        action = np.squeeze(action.detach().numpy())
+        # action=np.ndarray.item(action)
+        return action
+    
+    def update(self):
+        states, actions, rewards, next_states = self.RB.get_batch()
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+
+
+        # Critic loss        
+        Qvals1 = self.critic1.forward(states, actions)
+        Qvals2 = self.critic2.forward(states, actions)
+        na_= self.actor_target.forward(next_states).detach()
+        next_actions = np.clip(na_ + np.clip(np.random.normal(0,0.1,na_.size()),-.1,.1) ,-1,1).float()
+
+        next_Q1 = self.critic_target1.forward(next_states, next_actions)
+        next_Q2 = self.critic_target2.forward(next_states, next_actions)
+        next_Q=torch.min(next_Q1,next_Q2)
+
+        Qprime = rewards + self.gamma * next_Q.detach()
+        critic_loss1 = self.critic_loss1(Qvals1, Qprime)
+        self.c_L1.append(critic_loss1.detach().numpy())
+        critic_loss2 = self.critic_loss2(Qvals2, Qprime)
+        self.c_L2.append(critic_loss2.detach().numpy())
+
+        #Critic Update
+        self.critic_opt1.zero_grad()
+        critic_loss1.backward() 
+        self.critic_opt1.step()
+
+        self.critic_opt2.zero_grad()
+        critic_loss2.backward() 
+        self.critic_opt2.step()
+
+        if self.m%self.p==0:
+            # Actor loss
+            policy_loss = -self.critic1.forward(states, self.actor.forward(states)).mean()
+            self.p_L.append(policy_loss.detach().numpy())
+
+            # Actorupdate networks     
+
+            self.actor_opt.zero_grad()
+            policy_loss.backward()
+            self.actor_opt.step()
+
+            for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+            for target_param, param in zip(self.critic_target1.parameters(), self.critic1.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+            for target_param, param in zip(self.critic_target2.parameters(), self.critic2.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+        
+
+        self.m+=1
+
+        # update target networks 
+ 
+
+class OUActionNoise:
+    def __init__(self, mean, sigma_max=.35, sigma_min=0, theta=0.15, dt=1, decay_period=1e4, x_initial=None):
+        self.theta = theta
+        self.mean = mean
+        self.sigma = sigma_max
+        self.max_sigma=sigma_max
+        self.min_sigma=sigma_min
+        self.dt = dt
+        self.x_initial = x_initial
+        self.decay_period=decay_period
+        self.reset()
+
+    def __call__(self,t):
+        # Formula taken from https://www.wikipedia.org/wiki/Ornstein-Uhlenbeck_process.
+        x = (
+            self.x_prev
+            + self.theta * (self.mean - self.x_prev) * self.dt
+            + self.sigma * np.sqrt(self.dt) * np.random.normal(size=self.mean.shape)
+        )
+        # Store x into x_prev
+        # Makes next noise dependent on current one
+        self.x_prev = x
+        
+        
+        self.sigma = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
+        
+        return x
+
+    def reset(self):
+        if self.x_initial is not None:
+            self.x_prev = self.x_initial
+        else:
+            self.x_prev = np.zeros_like(self.mean)
+
+
+class mixer:
+    def __init__(self):
+        # Agent=agent_
+        self.clf=[]
+        self.data=[]
+
+
+        print('done')
+    def generate(self, comp=6):
+
+    
+        sb=Agent.RB.state_buffer
+        ab=Agent.RB.action_buffer
+        rb=Agent.RB.reward_buffer
+        ssb=Agent.RB.next_state_buffer
+
+        # sb2=np.concatenate(sb).squeeze(1)
+        # ab2=np.concatenate(ab).squeeze(1)
+        # rb2=np.concatenate(rb).squeeze(1)
+        # ssb2=np.concatenate(ssb).squeeze(1)
+
+        self.data=np.concatenate((sb,ab,rb,ssb),1)
+
+        data2=self.data[:,0:Agent.num_states+Agent.num_actions]
+        self.clf = mixture.GaussianMixture(n_components=comp, covariance_type="full")
+        self.clf.fit(data2)
+
+    def predict_set(self,x,a):
+        label=self.clf.predict(np.concatenate((x.T,a),1))
+        prb=self.clf.predict_proba(np.concatenate((x.T,a),1))
+
+        nb=self.data[self.clf.predict(self.data[:,0:Agent.num_states+Agent.num_actions])==label]
+
+        state_buffer=nb[:,0:Agent.num_states]
+        action_buffer=nb[:,Agent.num_states:Agent.num_states+Agent.num_actions]
+        reward_buffer=nb[:,Agent.num_states+Agent.num_actions:Agent.num_states+Agent.num_actions+1]
+        next_state_buffer= nb[:,Agent.num_states+Agent.num_actions+1:-1]
+
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if Agent.RB.buffer_counter < Agent.RB.batch_size/2:
+            states=state_buffer
+            actions=action_buffer
+            rewards=reward_buffer
+            next_states=next_state_buffer
+        else:
+            select=random.sample(range(len(Agent.RB.state_buffer)),Agent.RB.batch_size/2)
+            
+            for i in select:
+                states.append(state_buffer[i])
+                actions.append(action_buffer[i])
+                rewards.append(reward_buffer[i])
+                next_states.append(next_state_buffer[i])
+        pbL= [states, actions, rewards, next_states]
+        # return states, actions, rewards, next_states
+        return pbL
+
+
+# %%  BUffer
+
+
+
+class Buffer2:
+    def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
+        # Number of "experiences" to store at max
+        self.buffer_capacity = buffer_capacity
+        # Num of tuples to train on.
+        self.batch_size = batch_size
+
+        # Its tells us num of times record() was called.
+        self.buffer_counter = 0
+
+        # Instead of list of tuples as the exp.replay concept go
+        # We use different np.arrays for each tuple element
+        self.state_buffer = []
+        self.action_buffer = []
+        self.reward_buffer = []
+        self.next_state_buffer = []
+        self.on = 0
+        # self.state_buffer = np.zeros((self.buffer_capacity, n_states))
+        # self.action_buffer = np.zeros((self.buffer_capacity, n_actions))
+        # self.reward_buffer = np.zeros((self.buffer_capacity, 1))
+        # self.next_state_buffer = np.zeros((self.buffer_capacity, num_states))
+
+
+        self.num_states=n_states
+        self.num_actions=n_actions
+        self.clf=[]
+        self.data=[]
+        self.pbL=[]
+
+        self.state_buffer_s = []
+        self.action_buffer_s = []
+        self.reward_buffer_s = []
+        self.next_state_buffer_s = []
+
+    # Takes (s,a,r,s') obervation tuple as input
+    def record(self, obs_tuple):
+        # Set index to zero if buffer_capacity is exceeded,
+        # replacing old records
+        index = self.buffer_counter % self.buffer_capacity
+        
+        if self.buffer_counter > 0 and index==0:
+            self.on=1
+        if self.on==1:
+            self.state_buffer[index] = obs_tuple[0]
+            self.action_buffer[index] = obs_tuple[1]
+            self.reward_buffer[index] = obs_tuple[2]
+            self.next_state_buffer[index] = obs_tuple[3]
+        else:
+            self.state_buffer.append(obs_tuple[0])
+            self.action_buffer.append(obs_tuple[1])
+            self.reward_buffer.append(obs_tuple[2])
+            self.next_state_buffer.append(obs_tuple[3])
+
+        self.buffer_counter += 1
+            
+    def generate(self, comp=6):
+
+        del self.clf
+        
+        sb=self.state_buffer
+        ab=self.action_buffer
+        rb=self.reward_buffer
+        ssb=self.next_state_buffer
+
+        # sb2=np.concatenate(sb).squeeze(1)
+        # ab2=np.concatenate(ab).squeeze(1)
+        # rb2=np.concatenate(rb).squeeze(1)
+        # ssb2=np.concatenate(ssb).squeeze(1)
+
+        self.data=np.concatenate((sb,ab,rb,ssb),1)
+
+        data2=self.data[:,0:Agent.num_states+Agent.num_actions]
+        self.clf = mixture.GaussianMixture(n_components=comp, covariance_type="full")
+        self.clf.fit(data2)
+
+    def predict_set(self,x,a, comp=6):
+        # self.generate(comp)
+
+        label=self.clf.predict(np.concatenate((x.T,a),1))
+        prb=self.clf.predict_proba(np.concatenate((x.T,a),1))
+
+        nb=self.data[self.clf.predict(self.data[:,0:self.num_states+self.num_actions])==label]
+
+        state_buffer=nb[:,0:self.num_states]
+        action_buffer=nb[:,self.num_states:self.num_states+self.num_actions]
+        reward_buffer=nb[:,self.num_states+self.num_actions:self.num_states+self.num_actions+1]
+        next_state_buffer= nb[:,self.num_states+self.num_actions+1:]
+
+        # print(len(state_buffer))
+
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if len(state_buffer) < int(self.batch_size/2):
+            states=state_buffer
+            actions=action_buffer
+            rewards=reward_buffer
+            next_states=next_state_buffer
+        else:
+            select=random.sample(range(len(state_buffer)),int(self.batch_size/2))
+            
+            for i in select:
+                states.append(state_buffer[i])
+                actions.append(action_buffer[i])
+                rewards.append(reward_buffer[i])
+                next_states.append(next_state_buffer[i])
+        self.pbL= [states, actions, rewards, next_states]
+        # return states, actions, rewards, next_states
+        # return pbL
+
+    def get_batch(self):
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if self.buffer_counter < self.batch_size:
+            states=self.state_buffer
+            actions=self.action_buffer
+            rewards=self.reward_buffer
+            next_states=self.next_state_buffer
+        else:
+            select=random.sample(range(len(self.state_buffer)),self.batch_size)
+            
+            for i in select:
+                states.append(self.state_buffer[i])
+                actions.append(self.action_buffer[i])
+                rewards.append(self.reward_buffer[i])
+                next_states.append(self.next_state_buffer[i])
+        return states, actions, rewards, next_states
+    
+    def get_batch1_2(self):
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if self.buffer_counter < self.batch_size/2:
+            states=self.state_buffer
+            actions=self.action_buffer
+            rewards=self.reward_buffer
+            next_states=self.next_state_buffer
+        else:
+            select=random.sample(range(len(self.state_buffer)),int(self.batch_size/2))
+            
+            for i in select:
+                states.append(self.state_buffer[i])
+                actions.append(self.action_buffer[i])
+                rewards.append(self.reward_buffer[i])
+                next_states.append(self.next_state_buffer[i])
+
+        states=np.concatenate((self.pbL[0],states),0)
+        actions=np.concatenate((self.pbL[1],actions),0)
+        rewards=np.concatenate((self.pbL[2],rewards),0)
+        next_states=np.concatenate((self.pbL[3],next_states),0)
+
+        return states, actions, rewards, next_states
+
+
+
+# choose update based on proximity
+class DDPGagent_m:
+    def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
+        # Params
+        self.num_states = n_states
+        self.num_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+
+        self.c_L=[]
+        self.p_L=[]
+        self.Qcat=[]
+
+        # Networks
+        self.actor = policy(self.num_states,self.num_actions)
+        self.actor_target = policy(self.num_states,self.num_actions)
+        self.critic = Qfun(self.num_states, self.num_actions)
+        self.critic_target = Qfun(self.num_states, self.num_actions)
+
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data)
+        
+        # Training
+        self.RB = Buffer2(self.num_states,self.num_actions,buffer_capacity)        
+        self.critic_loss  = nn.MSELoss()
+        self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+        self.critic_opt= torch.optim.Adam(self.critic.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+    
+        # self.gmm=mixer()
+
+    def get_action(self, state):
+        state = torch.tensor([state]).float()
+        action = self.actor.forward(state)
+        action = np.squeeze(action.detach().numpy())
+        # action=np.ndarray.item(action)
+        return action
+    
+    def update(self):
+        
+        states, actions, rewards, next_states = self.RB.get_batch()
+        
+            
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+        # Critic loss        
+        Qvals = self.critic.forward(states, actions)
+        next_actions = self.actor_target.forward(next_states)
+        next_Q = self.critic_target.forward(next_states, next_actions.detach())
+        Qprime = rewards + self.gamma * next_Q
+        critic_loss = self.critic_loss(Qvals, Qprime)
+        self.c_L.append(critic_loss.detach().numpy())
+
+        self.Qcat.append(Qvals.mean().item())
+
+        # Actor loss
+        policy_loss = -self.critic.forward(states, self.actor.forward(states)).mean()
+        self.p_L.append(policy_loss.detach().numpy())
+
+        # update networks
+        self.actor_opt.zero_grad()
+        policy_loss.backward()
+        self.actor_opt.step()
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward() 
+        self.critic_opt.step()
+
+        # update target networks 
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+    def update1_2(self):
+        
+        
+        states, actions, rewards, next_states = self.RB.get_batch1_2()
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+        # Critic loss        
+        Qvals = self.critic.forward(states, actions)
+        next_actions = self.actor_target.forward(next_states)
+        next_Q = self.critic_target.forward(next_states, next_actions.detach())
+        Qprime = rewards + self.gamma * next_Q
+        critic_loss = self.critic_loss(Qvals, Qprime)
+        self.c_L.append(critic_loss.detach().numpy())
+
+        self.Qcat.append(Qvals.mean().item())
+
+        # Actor loss
+        policy_loss = -self.critic.forward(states, self.actor.forward(states)).mean()
+        self.p_L.append(policy_loss.detach().numpy())
+
+        # update networks
+        self.actor_opt.zero_grad()
+        policy_loss.backward()
+        self.actor_opt.step()
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward() 
+        self.critic_opt.step()
+
+        # update target networks 
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+
+def H_eR(prb,tempR):
+    H=0
+    R=0
+    for grp,s in enumerate(prb):
+            
+            R=R+s*tempR[grp][1]
+            if s <1e-6:
+                H=H+0
+            else:
+                H=H-s*np.log2(s)
+    return H,R
+
+
+def H_eR_(prb,tempR):
+    H=0
+    R=0
+    for grp,s in enumerate(prb):
+            
+            # R=R+s*tempR[grp][1]
+            if s <1e-6:
+                H=H+0
+            else:
+                H=H-s*np.log2(s)
+    return H,R
+
+class Buffer3:
+    def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
+        # Number of "experiences" to store at max
+        self.buffer_capacity = buffer_capacity
+        # Num of tuples to train on.
+        self.batch_size = batch_size
+
+        # Its tells us num of times record() was called.
+        self.buffer_counter = 0
+        self.catalog=[]
+
+        # Instead of list of tuples as the exp.replay concept go
+        # We use different np.arrays for each tuple element
+        self.state_buffer = []
+        self.action_buffer = []
+        self.reward_buffer = []
+        self.next_state_buffer = []
+        self.on = 0
+        # self.state_buffer = np.zeros((self.buffer_capacity, n_states))
+        # self.action_buffer = np.zeros((self.buffer_capacity, n_actions))
+        # self.reward_buffer = np.zeros((self.buffer_capacity, 1))
+        # self.next_state_buffer = np.zeros((self.buffer_capacity, num_states))
+
+
+        self.num_states=n_states
+        self.num_actions=n_actions
+        self.clf=[]
+        self.exp=[]
+        self.data=[]
+        self.pbL=[]
+        self.tempR=[]
+
+        self.state_buffer_s = []
+        self.action_buffer_s = []
+        self.reward_buffer_s = []
+        self.next_state_buffer_s = []
+
+    # Takes (s,a,r,s') obervation tuple as input
+    def record(self, obs_tuple):
+        # Set index to zero if buffer_capacity is exceeded,
+        # replacing old records
+        index = self.buffer_counter % self.buffer_capacity
+        
+        if self.buffer_counter > 0 and index==0:
+            self.on=1
+        if self.on==1:
+            self.state_buffer[index] = obs_tuple[0]
+            self.action_buffer[index] = obs_tuple[1]
+            self.reward_buffer[index] = obs_tuple[2]
+            self.next_state_buffer[index] = obs_tuple[3]
+        else:
+            self.state_buffer.append(obs_tuple[0])
+            self.action_buffer.append(obs_tuple[1])
+            self.reward_buffer.append(obs_tuple[2])
+            self.next_state_buffer.append(obs_tuple[3])
+
+        self.buffer_counter += 1
+            
+    def generate(self, comp=7):
+
+        del self.clf
+        del self.exp
+        
+        sb=self.state_buffer
+        ab=self.action_buffer
+        rb=self.reward_buffer
+        ssb=self.next_state_buffer
+
+        # sb2=np.concatenate(sb).squeeze(1)
+        # ab2=np.concatenate(ab).squeeze(1)
+        # rb2=np.concatenate(rb).squeeze(1)
+        # ssb2=np.concatenate(ssb).squeeze(1)
+
+        # self.data=np.concatenate((sb,ab,rb),1)
+        self.data=np.concatenate((sb,ab,rb,ssb),1)
+
+        data2=self.data[:,0:Agent.num_states+Agent.num_actions]
+        data3=self.data[:,0:Agent.num_states+Agent.num_actions+1]
+        # self.clf = mixture.BayesianGaussianMixture(n_components=20, covariance_type="full", max_iter=1000 )
+        self.clf = mixture.GaussianMixture(n_components=10, covariance_type="tied", max_iter=1000 )
+        self.clf.fit(data3)
+
+
+        # self.exp=mixture.BayesianGaussianMixture(n_components=20, covariance_type="full", max_iter=1000 )
+        self.exp=mixture.GaussianMixture(n_components=10, covariance_type="full")
+        self.exp.fit(data2)
+
+
+        colors=["blue","orange","green","red","purple","black"]
+        
+        self.tempR=[]
+        self.tempA=[]
+        
+        for i in range(self.exp.means_.shape[0]):
+            # plt.plot()
+            dsub = self.data[self.exp.predict(data2) == i]
+            # plt.scatter(dsub[:, 0], dsub[:, 2], color=color, marker="x")
+            self.tempR.append([i,np.mean(dsub[:,3]),np.std(dsub[:,3])])
+            self.tempA.append([i,np.mean(dsub[:,2]),np.std(dsub[:,2])])
+            # tempa.append([color,np.mean(dsub[:,2]),dsub[:,2]])
+            # print(color)
+            # print(np.mean(dsub[:,3]))
+            # print(np.std(dsub[:,3]))
+            # print('--------------------------------------------')
+
+    def pred_exp(self,x,api):
+        oo=21
+        X=np.tile(x.T,(oo,1))
+        A=np.expand_dims(np.linspace(-1,1,oo),1)
+        prb=self.exp.predict_proba(np.concatenate((X,A),1))
+        Entropy=[]
+        ExpR=[]
+        for i in prb:
+            
+            H, R_ =H_eR(i,self.tempR)
+            # H=0
+            # R_=0
+            # for grp,s in enumerate(i):
+                
+            #     R_=R_+s*self.tempR[grp][1]
+            #     if s <1e-6:
+            #         H=H+0
+            #     else:
+            #         H=H-s*np.log2(s)
+            Entropy.append(H)
+            ExpR.append(R_)
+        Rmin=max(ExpR)
+        Index=np.where(max(ExpR)==ExpR)[0][0]
+        Hrmin=Entropy[Index]
+
+
+
+        prbpi=self.exp.predict_proba(np.concatenate((x.T,api),1))
+        # Hpi=0
+        # Rpi=0
+        # for grp,s in enumerate(prbpi[0]):
+            
+        #     Rpi=Rpi+s*self.tempR[grp][1]
+        #     if s <1e-6:
+        #         Hpi=Hpi+0
+        #     else:
+        #         Hpi=Hpi-s*np.log2(s)
+        Hpi, Rpi=H_eR(prbpi[0],self.tempR)
+
+        IN_min=np.concatenate((x.T,np.expand_dims(A[Index],1),np.array([[Rmin]])),1)
+        IN_pi=np.concatenate((x.T,api,np.array([[Rpi]])),1)
+
+        out_min=self.clf.predict(IN_min)
+        prb_min=self.clf.predict_proba(IN_min)
+        out_pi=self.clf.predict(IN_pi)
+        prb_pi=self.clf.predict_proba(IN_pi)
+        
+        Rmin_clf=np.dot(prb_min,self.clf.means_[:,3:])
+        Rpi_clf=np.dot(prb_pi,self.clf.means_[:,3:])
+
+        H__m=H_eR_(prb_min[0],self.tempR)[0]
+        H__pi=H_eR_(prb_pi[0],self.tempR)[0]
+
+        # Index2=np.where(max(Entropy)==Entropy)[0][0]
+        # R_H1max=ExpR[Index2]
+
+
+
+
+
+
+        fsin=np.concatenate((X,A,np.array([ExpR]).T),1)
+
+        fullprb=self.clf.predict_proba(fsin)
+        fl=self.clf.predict(fsin)
+        ind3=np.where(max(self.clf.means_[:,3:])==self.clf.means_[:,3:])[0][0]
+        ind4=np.where(fl==ind3)[0]
+
+        Entropy2=[]
+        for i in fullprb:
+            
+            H, R_ =H_eR_(i,self.tempR)
+            Entropy2.append(H)
+
+        Index2=np.where(max(Entropy2)==Entropy2)[0][0]
+        R_H1max=ExpR[Index2]
+
+
+        # subcheck=False
+        # Hsub=[]
+        # H_check=[]
+        # for z in fullprb:
+        #     H_=H_eR_(z,self.tempR)[0]
+        #     H_check.append(H_)
+        # if len(ind4)>0:
+        #     subcheck=True
+        #     for w in ind4:
+        #         Hsub.append([w, H_check[w]])
+        #     Hsub=np.array(Hsub)
+        #     maxgrp=max(Hsub[:,1])
+        #     Hind=Hsub[np.where(max(Hsub[:,1])==maxgrp)]
+
+
+            # print(Hind)
+        # tds=[]
+        # for i in range(self.clf.means_.shape[0]):
+            
+        #     dsub =fsin[self.clf.predict(fsin) == i]
+        #     tds.append(dsub)
+        
+        
+
+        # subcheck=False
+        # if len(tds[ind3])>0:
+        #     subprb=self.clf.predict_proba(tds[ind3])
+        #     H_check=H_eR_(subprb[0],self.tempR)[0]
+        #     Hind=np.where(max(H_check)==H_check)
+        #     subcheck=True
+
+        if out_min==out_pi:
+            RminComp=Rmin
+            RpiComp=Rpi
+
+            # RminComp=Rmin/(H__m+1e-2)
+            # RpiComp=Rpi/(H__pi+1e-2)
+
+
+            if R_H1max>(np.mean(Agent.RB.data[:,3])):
+                action=np.expand_dims(A[Index2],1)+np.random.normal()*.03
+                self.catalog.append(4)
+
+
+            # if RminComp>RpiComp:
+            #     action=np.expand_dims(A[Index],1)+np.random.normal()*.03
+            #     self.catalog.append(0)
+            # else:
+            #     action=api+np.random.normal()*.03
+            #     self.catalog.append(1)
+
+            # action=np.expand_dims(A[int(Hind[0,0].item())],1) +np.random.normal()*.03
+            # self.catalog.append(4)
+
+            # action=api
+            # self.catalog.append(0)
+
+            elif H__m>H__pi:
+                action=np.expand_dims(A[Index],1)+np.random.normal()*.03
+                self.catalog.append(2)
+
+            else:
+                action=api+np.random.normal()*.03
+                self.catalog.append(3)
+
+
+
+        # elif subcheck:
+        #     action=np.expand_dims(A[int(Hind[0,0].item())],1) +np.random.normal()*.03
+        #     self.catalog.append(4)
+
+        else:
+            RminComp=Rmin
+            RpiComp=Rpi
+
+            if RminComp>RpiComp:
+                action=np.expand_dims(A[Index],1)+np.random.normal()*.03
+                self.catalog.append(0)
+            else:
+                action=api+np.random.normal()*.03
+                self.catalog.append(1)
+            
+            # if Hrmin>Hpi:
+            #     action=np.expand_dims(A[Index],1)+np.random.normal()*.03
+            #     self.catalog.append(2)
+
+            # else:
+            #     action=api+np.random.normal()*.03
+            #     self.catalog.append(3)
+
+            # action=api+np.random.normal()*.25
+            # action=np.expand_dims(A[Index],1)+np.random.normal()*.03
+            # self.catalog.append(4)
+
+
+
+# K=[]
+# Entropy=[]
+# ExpR=[]
+# B1=GnR.predict_proba(data2)
+# for i in B1:
+#     # print(i.shape)
+#     # print(np.max(i))
+#     k2=np.max(i)
+
+#     H=0
+#     R_=0
+#     for grp,s in enumerate(i):
+        
+#         R_=R_+s*tempR[grp][1]
+#         if s <1e-6:
+#             H=H+0
+#         else:
+#             H=H-s*np.log2(s)
+#     Entropy.append(H)
+#     ExpR.append(R_)
+#     # B1.shape
+#     # np.append(K,kkk)
+#     K.append(k2)
+
+# test=np.concatenate((data2,np.array([ExpR]).T),1)
+# # plt.hist(K)
+# # plt.hist(Entropy)
+
+# out=GR.predict(test)
+# outT=GR.predict(data3)
+
+        # thresh=0.9
+
+        # gg=[]
+        # grp=[]
+        # pick=[]
+        # pick2=[]
+        # pick3=[]
+        # a=np.array(self.tempR)
+        # a=a[a[:, 1].argsort()]
+        # if np.where(prb[:,int(a[-1,0])]>0.9)[0].size>0:
+        #     for i in np.where(prb[:,int(a[-1,0])]>0.9)[0]:
+        #         pick.append(i)
+        #         # grp.append(prb[i,:])
+
+        # if np.where((prb<thresh) & (prb>0.1))[0].size>0:
+        #     # nva=False
+
+        #     for i in np.where((prb<thresh) & (prb>0.1))[0]:
+        #        pick.append(i)
+
+
+               
+        # pick=list(set(pick))
+        # for i in pick:
+        #     grp.append(prb[i,:])
+
+        # if len(pick)>0:
+        #     nva=False
+        #     indx=random.choice(pick)
+        #     action=A[indx] +np.random.normal()*.03
+        #     print(prb[indx,:])
+        # else:
+        #     nva=True
+        #     action=[]
+
+        
+        # return nva, action
+        return action
+        
+
+    def predict_set(self,x,a, comp=6):
+        # self.generate(comp)
+
+        # label=self.clf.predict(np.concatenate((x.T,a),1))
+        # prb=self.clf.predict_proba(np.concatenate((x.T,a),1))
+
+        means=self.clf.means_
+        sel=max(means[:,3])
+
+        nb=self.data[self.clf.predict(self.data[:,0:Agent.num_states+Agent.num_actions+1])==np.where(means==sel)[0].item()]
+
+        state_buffer=nb[:,0:self.num_states]
+        action_buffer=nb[:,self.num_states:self.num_states+self.num_actions]
+        reward_buffer=nb[:,self.num_states+self.num_actions:self.num_states+self.num_actions+1]
+        next_state_buffer= nb[:,self.num_states+self.num_actions+1:]
+
+        # print(len(state_buffer))
+
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if len(state_buffer) < int(self.batch_size/2):
+            states=state_buffer
+            actions=action_buffer
+            rewards=reward_buffer
+            next_states=next_state_buffer
+        else:
+            select=random.sample(range(len(state_buffer)),int(self.batch_size/2))
+            
+            for i in select:
+                states.append(state_buffer[i])
+                actions.append(action_buffer[i])
+                rewards.append(reward_buffer[i])
+                next_states.append(next_state_buffer[i])
+        self.pbL= [states, actions, rewards, next_states]
+        # return states, actions, rewards, next_states
+        # return pbL
+
+    def get_batch(self):
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if self.buffer_counter < self.batch_size:
+            states=self.state_buffer
+            actions=self.action_buffer
+            rewards=self.reward_buffer
+            next_states=self.next_state_buffer
+        else:
+            select=random.sample(range(len(self.state_buffer)),self.batch_size)
+            
+            for i in select:
+                states.append(self.state_buffer[i])
+                actions.append(self.action_buffer[i])
+                rewards.append(self.reward_buffer[i])
+                next_states.append(self.next_state_buffer[i])
+        return states, actions, rewards, next_states
+    
+    def get_batch1_2(self):
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if self.buffer_counter < self.batch_size/2:
+            states=self.state_buffer
+            actions=self.action_buffer
+            rewards=self.reward_buffer
+            next_states=self.next_state_buffer
+        else:
+            select=random.sample(range(len(self.state_buffer)),int(self.batch_size/2))
+            
+            for i in select:
+                states.append(self.state_buffer[i])
+                actions.append(self.action_buffer[i])
+                rewards.append(self.reward_buffer[i])
+                next_states.append(self.next_state_buffer[i])
+
+        states=np.concatenate((self.pbL[0],states),0)
+        actions=np.concatenate((self.pbL[1],actions),0)
+        rewards=np.concatenate((self.pbL[2],rewards),0)
+        next_states=np.concatenate((self.pbL[3],next_states),0)
+
+        return states, actions, rewards, next_states
+
+
+
+# Choose Update for reard
+class DDPGagent_m2:
+    def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
+        # Params
+        self.num_states = n_states
+        self.num_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+
+        self.c_L=[]
+        self.p_L=[]
+        self.Qcat=[]
+
+        # Networks
+        self.actor = policy(self.num_states,self.num_actions)
+        self.actor_target = policy(self.num_states,self.num_actions)
+        self.critic = Qfun(self.num_states, self.num_actions)
+        self.critic_target = Qfun(self.num_states, self.num_actions)
+
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data)
+        
+        # Training
+        self.RB = Buffer3(self.num_states,self.num_actions,buffer_capacity)        
+        self.critic_loss  = nn.MSELoss()
+        self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+        self.critic_opt= torch.optim.Adam(self.critic.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+    
+        # self.gmm=mixer()
+
+    def get_action(self, state):
+        state = torch.tensor([state]).float()
+        action = self.actor.forward(state)
+        action = np.squeeze(action.detach().numpy())
+        # action=np.ndarray.item(action)
+        return action
+    
+    def get_action1_2(self, state_):
+        x = np.array([state_]).T
+        state = torch.tensor([state_]).float()
+        action = self.actor.forward(state)
+        api = action.detach().numpy()
+
+        asub=self.RB.pred_exp(x,api)
+        # nva, asub=self.RB.pred_exp(x,api)
+
+        # if nva:
+        #     state = torch.tensor([state_]).float()
+        #     action = self.actor.forward(state)
+        #     action = np.squeeze(action.detach().numpy())
+        #     # action=np.ndarray.item(action)
+        # else:
+        #     action=np.array(asub)
+        nva=False
+        action=asub
+        return action, nva
+
+    def update(self):
+        
+        states, actions, rewards, next_states = self.RB.get_batch()
+        
+            
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+        # Critic loss        
+        Qvals = self.critic.forward(states, actions)
+        next_actions = self.actor_target.forward(next_states)
+        next_Q = self.critic_target.forward(next_states, next_actions.detach())
+        Qprime = rewards + self.gamma * next_Q
+        critic_loss = self.critic_loss(Qvals, Qprime)
+        self.c_L.append(critic_loss.detach().numpy())
+
+        self.Qcat.append(Qvals.mean().item())
+
+        # Actor loss
+        policy_loss = -self.critic.forward(states, self.actor.forward(states)).mean()
+        self.p_L.append(policy_loss.detach().numpy())
+
+        # update networks
+        self.actor_opt.zero_grad()
+        policy_loss.backward()
+        self.actor_opt.step()
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward() 
+        self.critic_opt.step()
+
+        # update target networks 
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+    def update1_2(self):
+        
+        
+        states, actions, rewards, next_states = self.RB.get_batch1_2()
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+        # Critic loss        
+        Qvals = self.critic.forward(states, actions)
+        next_actions = self.actor_target.forward(next_states)
+        next_Q = self.critic_target.forward(next_states, next_actions.detach())
+        Qprime = rewards + self.gamma * next_Q
+        critic_loss = self.critic_loss(Qvals, Qprime)
+        self.c_L.append(critic_loss.detach().numpy())
+
+        self.Qcat.append(Qvals.mean().item())
+
+        # Actor loss
+        policy_loss = -self.critic.forward(states, self.actor.forward(states)).mean()
+        self.p_L.append(policy_loss.detach().numpy())
+
+        # update networks
+        self.actor_opt.zero_grad()
+        policy_loss.backward()
+        self.actor_opt.step()
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward() 
+        self.critic_opt.step()
+
+        # update target networks 
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+
+# %% select best groups
+
+# def pred_exp(self,x):
+#         X=np.tile(x.T,(21,1))
+#         A=np.expand_dims(np.linspace(-1,1,21),1)
+#         prb=self.exp.predict_proba(np.concatenate((X,A),1))
+
+#         thresh=0.9
+
+#         gg=[]
+#         grp=[]
+#         pick=[]
+#         pick2=[]
+#         pick3=[]
+#         a=np.array(self.tempR)
+#         a=a[a[:, 1].argsort()]
+#         if np.where(prb[:,int(a[-1,0])]>0.9)[0].size>0:
+#             for i in np.where(prb[:,int(a[-1,0])]>0.9)[0]:
+#                 pick.append([(i,int(a[-1,0])),prb[i,int(a[-1,0])]])
+
+#         if np.where((prb<thresh) & (prb>0.1))[0].size>0:
+#             nva=False
+            
+
+
+#             for i in np.where((prb<thresh) & (prb>0.1))[0]:
+               
+
+
+#                 z=prb[i,:]
+#                 z=np.delete(z,np.where(prb[i,:]==max(prb[i,:])))
+#                 gg.append(prb[i,:])
+#                 grp.append([(i,np.where(prb[i,:]==max(prb[i,:]))[0].item()),max(prb[i,:]),(i,np.where(prb[i,:]==max(z))[0].item()),max(z)])
+#             for i in grp:
+#                 if i[0][1]==a[-1,0]:
+#                     pick.append(i)
+#                 elif i[0][1]==a[-2,0]:
+#                     pick2.append(i)
+#                 elif i[0][1]==a[-3,0]:
+#                     pick3.append(i)
+
+#             if len(pick)>0:
+#                 indx=random.choice(pick)
+#             elif len(pick2)>0:
+#                 indx=random.choice(pick2)
+#             elif len(pick3)>0:
+#                 indx=random.choice(pick3)
+#             else:
+#                 nva=True
+#                 action=[]
+#             if not nva:
+#                 action=A[indx[0][0]]
+#                 print(indx)
+#         else:
+#             nva=True
+#             action=[]
+#         return nva, action
+
+# %% vfmpc buffer
+
+class vf_Buffer3:
+    def __init__(self, buffer_capacity=1000, batch_size=10):
+        # Number of "experiences" to store at max
+        self.buffer_capacity = buffer_capacity
+        # Num of tuples to train on.
+        self.batch_size = batch_size
+
+        # Its tells us num of times record() was called.
+        self.buffer_counter = 0
+
+        self.buffer=[]
+        
+
+    # Takes (s,a,r,s') obervation tuple as input
+    def record(self, obs_tuple):
+        # Set index to zero if buffer_capacity is exceeded,
+        # replacing old records
+
+        if len(self.buffer)>=self.buffer_capacity:
+            self.buffer.pop(0)
+        self.buffer.append(obs_tuple)
+        
+        # index = self.buffer_counter % self.buffer_capacity
+        self.buffer_counter += 1
+        
+    def get_batch(self):
+        
+
+        # p=[zvals,rt,Gt,zprime]
+        
+
+        if self.buffer_counter < self.batch_size:
+            NN=self.buffer_counter
+            for k,i in enumerate(self.buffer):
+                if k==0:
+                    R_star_c=i[0]
+                    z_c=i[1]
+                    R_c=i[2]
+                    
+                else:
+                    R_star_c=torch.cat((R_star_c,i[0]),0)
+                    z_c=torch.cat((z_c,i[1]),0)
+                    R_c=torch.cat((R_c,i[2]),0)
+                    
+        else:
+            select=random.sample(range(len(self.buffer)),self.batch_size)
+            R_star_c=self.buffer[select[0]][0]
+            z_c=self.buffer[select[0]][1]
+            R_c=self.buffer[select[0]][2]
+            
+            for i in select[1:]:
+                R_star_c=torch.cat((R_star_c,self.buffer[i][0]),0)
+                z_c=torch.cat((z_c,self.buffer[i][1]),0)
+                R_c=torch.cat((R_c,self.buffer[i][2]),0)
+            
+            NN=len(select)
+        return R_star_c, z_c, R_c, NN
+
+
+# %% SCR
+
+
+# %% SCR unit
+class SCR:
+    def __init__(self,du_sc=None,u_sc=None,y_sc=None):
+        self.h = 0.1
+        self.A = np.array([[0.9464,0.0056],
+                          [0.0043,0.1207]])
+        self.B = np.array([[-0.0100],
+                          [0.0040]])
+        
+        ####################################################################
+        self.C = np.array([[1,0],[0,1]])
+        # self.C = np.array([[1,0]])
+        ####################################################################
+
+        self.f1 = 0.95
+        self.f2 = 1.05
+        self.Aoffset = np.array([[self.f1*0.9464,self.f2*0.0056],
+                          [self.f2*0.0043,self.f1*0.1207]])
+        self.Boffset = np.array([[self.f2*-0.0100],
+                          [self.f2*0.0040]])
+        self.Coffset = np.array([1,0])
+
+        self.Hy = np.array([[0.9985, 0.4769],[-0.0105,0.4804]])
+        self.Hu = np.array([[-0.0030, -4.9521e-6],[0.0023, 1.6833e-6]])
+        self.ysp = 0
+
+        ####################################################################
+        # self.Q=np.array([[1, 0], [0, .01]])
+        self.Q=np.array([[100, 0], [0, 1]])
+        # self.Q=np.eye(self.C.shape[0])
+        ####################################################################
+
+        self.rw=0.0001
+        self.uprev=0
+
+        self.du_sc=du_sc
+        self.u_sc=u_sc
+        self.y_sc=y_sc
+
+
+    def model(self,x,u):
+        xplus = self.A@x + self.B@u
+        yplus = self.C@xplus
+        return xplus, yplus
+
+    def modeloffset(self,x,u):
+        xplus = self.Aoffset@x + self.Boffset@u
+        yplus = self.Coffset@xplus
+        return xplus, yplus
+    
+    def nlmodel(self,x,u):
+        u = np.array([[u.item()],[u.item()**2]])
+        xplus = self.Hy@x + self.Hu@u
+        yplus = self.C@xplus
+        return xplus,yplus
+
+    def reward(self,x,ysp,u,uprev=None):
+        if uprev is not None:
+            du=u-uprev
+        else:
+            du=u-self.uprev
+        # Q = np.array([[100, 0],
+        #               [0, 1]])
+        # ymod=self.C@x-ysp
+        # du=u-self.uprev
+        #R = -np.matmul(np.transpose(x),x)-np.matmul(np.transpose(u),u)
+        # R = -(x.T@Q@x)-0.0001*u.T@u
+        # R = -(x[0])**2
+
+
+        if self.y_sc is not None:
+            yn=self.C@x
+            for i in range(ss.C.shape[0]):
+            # for i in range(len(self.y_sc)):
+                yn[i,0]=self.y_sc[i].norm(yn[i,0])
+                ysp=self.y_sc[i].norm(ysp)
+            ymod=yn-ysp
+        else:
+            ymod=self.C@x-ysp
+        if self.du_sc is not None:
+            for i in range(len(self.du_sc)):
+                du[i,0]=self.du_sc[i].norm(du[i,0])
+
+
+        R=-(np.matmul(np.matmul(ymod.T,self.Q),ymod))-self.rw*np.matmul(du,du)
+        return R
+    
+    def Gcalc(self,xtraj,utraj,Np,gamma):
+            Gcat=[0]
+            rcat=[0]
+            G=0
+            for i in range(1,len(xtraj[0])-1):
+            # for i in range(Np-1):
+
+
+                
+            
+                R=self.reward(np.array([[  xtraj[0][i], xtraj[1][i] ]]).T, self.ysp,   np.array([[  utraj[0][i] ]]),np.array([[  utraj[0][i-1] ]])  )
+
+                # if i==0:
+                #     R=self.reward(np.array([[  xtraj[0][i], xtraj[1][i] ]]).T, self.ysp,   np.array([[  utraj[0][i] ]]))
+                # else:
+                #     R=self.reward(np.array([[  xtraj[0][i], xtraj[1][i] ]]).T, self.ysp,   np.array([[  utraj[0][i] ]]),np.array([[  utraj[0][i-1] ]])  )
+                rcat.append(R.squeeze().tolist())
+                G=G+R.squeeze().tolist()*gamma**(i+1)
+                Gcat.append(G)
+            return Gcat,rcat
+
+
+    def stepmodel(self,x,u):
+        xp, yp = self.model(x,u)
+        dx = xp - x
+        
+        R = self.reward(xp,self.ysp,u)
+        if (R>-1e-6) or abs(xp[0,0])>5 or abs(xp[1,0])>5:
+          isdone = 1
+        else:
+          isdone = 0
+        #print(isdone)
+        self.uprev=u
+        return xp,yp, R, isdone
+
+    def stepmodeloffset(self,x,u):
+        #xp, yp = self.modeloffset(x,u)
+        xp, yp = self.nlmodel(x,u)
+        dx = xp - x
+        
+        R = self.reward(xp,self.ysp,u)
+        if (R>-1e-6) or abs(xp[0,0])>5 or abs(xp[1,0])>5:
+          isdone = 1
+        else:
+          isdone = 0
+        #print(isdone)
+        self.uprev=u
+        return xp,yp, R, isdone
+
+    def reset(self,maxk):
+      s = np.zeros((2,1))
+      y = np.zeros((1,))
+      posneg = np.array([-1,1])
+      s[0,0] = 4*posneg[np.random.randint(2)]*np.random.rand()
+      s[1,0] = 4*posneg[np.random.randint(2)]*np.random.rand()
+      dmag = 0.5*posneg[np.random.randint(2)]*np.random.rand()
+      return s, y, dmag
+
+
+#  %% Path
+
+# G:\My Drive\Python Scripts\conf_set\glocal1
+
+# print('G LOCAL 1')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal1')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# test if rewaard does better
+# print('G LOCAL 2')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal2')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# standard vs reward
+# print('G LOCAL 2_2')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal2_2')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# tau 0.01 Best
+# print('G LOCAL 3')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal3')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# Load buffer in best
+# print('G LOCAL 4')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal4')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# load buffer standard
+# print('G LOCAL 4_2')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal4_2')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+
+
+# special train 500 episodes
+# print('G LOCAL 5')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal5')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+
+# special train standard
+# print('G LOCAL 6')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal6')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# special explore
+# print('G LOCAL 7')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal7')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+
+
+# %%
+
+# Standard
+# print('G LOCAL 8')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal8')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# Reward focus update
+# print('G LOCAL 9')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal9')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# exploration focus
+# print('G LOCAL 10')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal10')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# Use both
+# print('G LOCAL 11')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal1')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+
+# %%
+# print('G LOCAL 12')
+# pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal12')
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+
+print('G LOCAL 13')
+pbse=(r'G:\My Drive\Python Scripts\conf_set\glocal13')
+path_c1_s=(pbse+'\critic1')
+path_ct1_s=(pbse+'\critic_target1')
+path_a_s=(pbse+r'\actor')
+path_at_s=(pbse+r'\actor_target')
+
+
+# %% spec opt
+# RB_=t1.RB.buffer
+# cat_=t1.cat.buffer
+
+
+def mov_med(rcat,mds_=60*3):
+    ccc=[]
+    mds=mds_
+    for i in range(len(rcat)):
+        if i<mds:
+            ccc.append(np.median(rcat[0:i+1]))
+        else:
+            ccc.append(np.median(rcat[i-mds:i]))
+    return ccc
+
+def mov_mean(rcat,mds_=60*3):
+    ccc=[]
+    mds=mds_
+    for i in range(len(rcat)):
+        if i<mds:
+            ccc.append(np.mean(rcat[0:i+1]))
+        else:
+            ccc.append(np.mean(rcat[i-mds:i]))
+    return ccc
+
+
+
+###################################################################
+###################################################################
+###################################################################
+import numpy as np
+from matplotlib import pyplot as plt
+import pickle
+
+def loss_plot(pfile_L):
+    with open(pfile_L, "rb") as pkl_rb_obj:
+        Loss = pickle.load(pkl_rb_obj)  
+    # Loss=np.array(t1.rbfL)
+
+# pfile_L=pbse + '\Loss.pkl'
+
+#         Loss=[Agent.p_L,Agent.c_L,rcat]
+
+    loss1=Loss[0]
+    loss2=Loss[1]
+    rcat=Loss[2]
+    
+    
+    Ml1=mov_mean(loss1,65*5)
+    Ml2=mov_mean(loss2,65*5)
+    
+    rvg=mov_med(rcat,65*3)
+
+    plt.figure()
+    plt.plot(loss1)
+    plt.plot(Ml1)
+    plt.title('Policy')
+    plt.grid()
+    plt.figure()
+    plt.plot(loss2)
+    plt.plot(Ml2)
+    plt.title('Critic')
+    plt.grid()
+
+
+    plt.figure()
+    plt.plot(loss1[int(len(loss1)/2):])
+    plt.plot(Ml1[int(len(loss1)/2):])
+    plt.title('Policy 1/2')
+    plt.grid()
+    plt.figure()
+    plt.plot(loss2[int(len(loss2)/2):])
+    plt.plot(Ml2[int(len(loss2)/2):])
+    plt.title('Critic 1/2')
+    plt.grid()
+
+
+    plt.figure()
+    plt.plot(loss1[int(len(loss1)/2):])
+    plt.plot(Ml1[int(len(loss1)/2):])
+    plt.title('Policy 1/2')
+    plt.grid()
+    plt.ylim([-0.01, max(Ml1[int(len(loss1)/2):])*1.1])
+    
+    plt.figure()
+    plt.plot(loss2[int(len(loss2)/2):])
+    plt.plot(Ml2[int(len(loss2)/2):])
+    plt.title('Critic 1/2')
+    plt.grid()
+    plt.ylim([-0.01, max(Ml2[int(len(loss2)/2):])*1.1])
+    plt.figure()
+
+
+    
+
+    plt.figure()
+    plt.plot(rcat)
+    plt.plot(rvg)
+
+# pfile_L=pbse + '\Loss.pkl'
+# loss_plot(pfile_L)
+# %% Initialize
+
+
+#Double Int
+# dulb=[-5]
+# duub=[5]
+# ulb=[-10]
+# uub=[10]
+# ylb=[-20]
+# yub=[20]
+# du_sc=create_scales_tanh(dulb,duub)
+# u_sc=create_scales_tanh(ulb,uub)
+# y_sc=create_scales_tanh(ylb,yub)
+# ss=double_int(du_sc,u_sc,y_sc)
+# di_status=True    #using Double integrator model
+# scr_status=False    #using SCR model
+
+# # ss.C=np.eye(2)
+# # ss.Q=np.eye(2)
+
+
+#SCR
+dulb=[-100]
+duub=[100]
+ulb=[-400]
+uub=[400]
+ylb=[-10, -3]
+yub=[10, 3]
+du_sc=create_scales_tanh(dulb,duub)
+u_sc=create_scales_tanh(ulb,uub)
+y_sc=create_scales_tanh(ylb,yub)
+ss=SCR(du_sc,u_sc,y_sc)
+di_status=False    #using Double integrator model
+scr_status=True    #using SCR model
+
+
+
+sp=0
+
+
+wd=0
+bs=128
+n_states=2
+n_actions=1
+Agent=DDPGagent_m2(n_states,n_actions, 1e-4, 1e-3, 0.99, 0.01, 100000, bs, wd)   #reward rank
+# Agent=DDPGagent_m(n_states,n_actions, 1e-4, 1e-3, 0.99, 0.01, 100000, bs, wd)   #test learn
+# Agent=DDPGagent_m(n_states,n_actions, 1e-4, 3e-4, 0.99, 0.01, 100000, bs, wd)   #deliberate learn bad good
+# Agent=DDPGagent(n_states,n_actions, 1e-4, 3e-4, 0.99, 0.01, 100000, bs, wd)   #deliberate bad
+# Agent=DDPGagent(n_states,n_actions, 1e-4, 1e-3, 0.99, 0.01, 100000, bs, wd)  #normal
+# (n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):)
+
+
+
+
+# nam_con="ep_500_01132025_special_train_standard"
+# pfile=(r"G:\My Drive\Python Scripts\conf_set\data\buffile_"+nam_con+".pkl")
+# with open(pfile, "rb") as pkl_rb_obj:
+#         buffile = pickle.load(pkl_rb_obj) 
+
+# Agent.RB.state_buffer=buffile[:,0:2].tolist()
+# Agent.RB.action_buffer=buffile[:,2:3].tolist()
+# Agent.RB.reward_buffer=buffile[:,3:4].tolist()
+# Agent.RB.next_state_buffer=buffile[:,4:].tolist()
+# Agent.RB.buffer_counter=len(buffile[:,0])
+
+# %% Settings
+
+special_train=False
+special_exp=True
+
+#Train
+# epmax=100
+# tfinal=30
+# # noise=0.01 ##########################
+# noise=0.25 ##########################
+# # noise=0.32 ##########################
+# static_nn=False
+# save_nn=True   ###############################################
+# dist_select=False
+# decay_dist_select=False
+# decay_B=False
+# switch_B=False
+# save_loss=True   ###############################################
+
+
+
+#Test
+epmax=10
+tfinal=30
+noise=0
+static_nn=True    #not training NN model or updating OMLT
+save_nn=False      #save NN
+dist_select=True   #use select disturbances
+decay_dist_select=False
+decay_B=False
+switch_B=False
+save_loss=False
+special_train=False
+special_exp=False
+
+
+
+
+
+# decay loop
+# epmax=100
+# tfinal=60
+# noise=0
+# static_nn=True #############################
+# save_nn=False
+# dist_select=False
+# decay_dist_select=True
+# decay_B=False
+# switch_B=False
+# save_loss=False
+# t1.iter=10
+
+#exp
+# epmax=1
+# tfinal=10
+# noise=0.0 ##########################
+# # noise=0.15 ##########################
+# static_nn=True
+# save_nn=False   ###############################################
+# dist_select=False
+# decay_dist_select=True
+# decay_B=False
+# switch_B=False
+# save_loss=False
+# t1.iter=10
+
+
+offset=True       #use offset SCR model vs MPC mode (differing models)
+rl_status=True      #use RL over MPC
+# nlmodel=False   #use nl model constraints in MPC
+save_data=False  #record data for trial
+
+temp_mod=False
+
+Hu0=ss.Hu
+Hy0=ss.Hy
+
+DmatY=np.array([[(1), (.41)],[(.95),(0.98)]])
+DmatU=np.array([[(0.8), (0.9)],[(2.51),(2)]])
+
+# ss.Hy=np.multiply(Hy0,DmatY)
+# ss.Hu=np.multiply(Hu0,DmatU)
+
+
+################################################################
+# ss.C=np.array([[1,0]])
+# ss.Q=np.array([[1]])
+
+OUA=OUActionNoise(np.array(0),sigma_max=noise, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmax*tfinal)
+# %%
+
+# path_c1_s=(pbse+'\critic1')
+# path_ct1_s=(pbse+'\critic_target1')
+# path_a_s=(pbse+r'\actor')
+# path_at_s=(pbse+r'\actor_target')
+
+# Agent.actor= torch.load(path_a_s)
+# Agent.actor_target= torch.load(path_at_s)
+# Agent.critic= torch.load(path_c1_s)
+# Agent.critic_target= torch.load(path_ct1_s)
+
+
+# %%
+
+dist_scr=[np.array([[0.62053369],
+        [1.22600576]]),
+ np.array([[-3.52617473],
+        [-1.24147056]]),
+ np.array([[4.36503407],
+        [1.33052744]]),
+ np.array([[ 0.12886711],
+        [-0.10233823]]),
+ np.array([[-0.44564937],
+        [-1.49241653]]),
+ np.array([[-3.08370142],
+        [ 0.12104975]]),
+ np.array([[-6.46658544],
+        [-0.54416887]]),
+ np.array([[ 4.63572076],
+        [-1.94529455]]),
+ np.array([[ 4.24823588],
+        [-0.28993123]]),
+ np.array([[-2.76261956],
+        [ 1.29750454]])]
+
+decay_dist=[np.array([[ 3.50077325],
+                    [-2.33552661]]),
+            np.array([[ 3.33137922],
+                    [-4.64623176]]),
+            np.array([[-2.98269842],
+                    [ 6.30570546]]),
+            np.array([[5.88421606],
+                    [3.7294569 ]]),
+            np.array([[-4.04633107],
+                    [ 6.41195325]]),
+            np.array([[0.26864626],
+                    [4.06348675]]),
+            np.array([[-5.17764778],
+                    [-2.68035882]]),
+            np.array([[-2.72876116],
+                    [ 1.74856342]]),
+            np.array([[-4.64235626],
+                    [ 0.28398791]]),
+            np.array([[ 1.83219793],
+                    [-4.10379263]]),
+            np.array([[-1.86921947],
+                    [-5.25677072]]),
+            np.array([[ 5.37234666],
+                    [-1.50578377]]),
+            np.array([[-5.70520458],
+                    [-1.95928178]]),
+            np.array([[0.61637251],
+                    [2.29471977]]),
+            np.array([[-1.95961601],
+                    [-6.09868303]]),
+            np.array([[-2.77083759],
+                    [ 2.64723714]]),
+            np.array([[-0.38399841],
+                    [ 4.66617444]]),
+            np.array([[5.68586023],
+                    [6.08430261]]),
+            np.array([[-1.54519979],
+                    [ 5.12864578]]),
+            np.array([[-6.0796418 ],
+                    [ 0.35093431]]),
+            np.array([[0.93717445],
+                    [0.63810375]]),
+            np.array([[ 5.65503803],
+                    [-1.58104562]]),
+            np.array([[6.21042536],
+                    [0.49830966]]),
+            np.array([[ 4.00344218],
+                    [-0.45787868]]),
+            np.array([[1.57142141],
+                    [1.54029018]]),
+            np.array([[-1.1383341 ],
+                    [ 4.46784676]]),
+            np.array([[1.16433632],
+                    [4.51518904]]),
+            np.array([[-6.43805268],
+                    [ 0.12271865]]),
+            np.array([[-0.29191634],
+                    [-1.72292959]]),
+            np.array([[-0.14522268],
+                    [ 4.5894942 ]]),
+            np.array([[3.82991386],
+                    [2.9612656 ]]),
+            np.array([[ 5.61617054],
+                    [-1.32354662]]),
+            np.array([[-1.01846038],
+                    [ 0.40372778]]),
+            np.array([[1.61659645],
+                    [3.18366913]]),
+            np.array([[-3.41044371],
+                    [-0.44912873]]),
+            np.array([[ 1.61939032],
+                    [-3.93888612]]),
+            np.array([[ 3.65715408],
+                    [-1.24682799]]),
+            np.array([[-5.49071254],
+                    [-4.80396837]]),
+            np.array([[ 1.63736536],
+                    [-4.86428674]]),
+            np.array([[ 5.07069418],
+                    [-1.13849344]]),
+            np.array([[ 0.23021372],
+                    [-4.53911576]]),
+            np.array([[4.79227135],
+                    [5.21727131]]),
+            np.array([[-0.67765521],
+                    [-0.00765028]]),
+            np.array([[6.03709894],
+                    [5.41292823]]),
+            np.array([[-5.77627954],
+                    [ 3.12717395]]),
+            np.array([[4.11147433],
+                    [2.83617468]]),
+            np.array([[0.17649724],
+                    [0.35610993]]),
+            np.array([[4.27102832],
+                    [3.14270392]]),
+            np.array([[-4.93805068],
+                    [-5.66214015]]),
+            np.array([[0.32477454],
+                    [0.83562004]]),
+            np.array([[5.70847398],
+                    [0.80842556]]),
+            np.array([[0.80875327],
+                    [1.69211904]]),
+            np.array([[-1.15172389],
+                    [-6.19651167]]),
+            np.array([[-1.99734725],
+                    [ 6.47514326]]),
+            np.array([[-0.57288647],
+                    [-4.00863395]]),
+            np.array([[-5.9463352 ],
+                    [ 3.71723876]]),
+            np.array([[-2.44166643],
+                    [-1.6859975 ]]),
+            np.array([[-4.28051009],
+                    [ 1.64998245]]),
+            np.array([[4.07103332],
+                    [3.48691964]]),
+            np.array([[-4.99208874],
+                    [-4.03230518]]),
+            np.array([[ 2.62601826],
+                    [-4.51050717]]),
+            np.array([[-4.87286682],
+                    [ 0.98898742]]),
+            np.array([[2.60091335],
+                    [6.00409839]]),
+            np.array([[5.71022643],
+                    [6.02923244]]),
+            np.array([[6.16572113],
+                    [3.73015519]]),
+            np.array([[1.73768291],
+                    [3.53956175]]),
+            np.array([[-1.82388301],
+                    [ 5.49140591]]),
+            np.array([[ 3.32473733],
+                    [-1.5317327 ]]),
+            np.array([[ 2.34890871],
+                    [-4.60431061]]),
+            np.array([[ 5.75809124],
+                    [-5.58417785]]),
+            np.array([[3.31016934],
+                    [4.8805454 ]]),
+            np.array([[3.25726186],
+                    [1.52779955]]),
+            np.array([[-6.06880423],
+                    [-5.46957073]]),
+            np.array([[3.34509959],
+                    [3.35935444]]),
+            np.array([[ 2.85318502],
+                    [-3.37963432]]),
+            np.array([[ 6.36794617],
+                    [-2.14806702]]),
+            np.array([[-0.58882523],
+                    [ 5.3817134 ]]),
+            np.array([[-0.84954327],
+                    [ 1.70747192]]),
+            np.array([[-0.35372706],
+                    [-5.96011221]]),
+            np.array([[ 4.17702116],
+                    [-1.5707476 ]]),
+            np.array([[-2.15342932],
+                    [ 3.02623577]]),
+            np.array([[-2.45838955],
+                    [ 6.24883974]]),
+            np.array([[-0.51752489],
+                    [-1.68630143]]),
+            np.array([[-0.9465436 ],
+                    [ 1.64099264]]),
+            np.array([[-3.89755643],
+                    [ 5.66339133]]),
+            np.array([[ 4.8326743 ],
+                    [-2.95856404]]),
+            np.array([[ 1.8225697 ],
+                    [-0.22613828]]),
+            np.array([[0.59835606],
+                    [4.55386007]]),
+            np.array([[-5.96175076],
+                    [-0.35394058]]),
+            np.array([[-0.64346648],
+                    [-4.88498333]]),
+            np.array([[-5.84805203],
+                    [-0.72019513]]),
+            np.array([[3.96368814],
+                    [0.61813875]]),
+            np.array([[-2.12912745],
+                    [ 3.55285253]]),
+            np.array([[-6.05029572],
+                    [ 1.78347625]]),
+            np.array([[ 1.47482031],
+                    [-4.21020742]]),
+            np.array([[3.52032813],
+                    [5.25475701]]),
+            np.array([[-1.7384985 ],
+                    [-3.45929679]]),
+            np.array([[-3.29685479],
+                    [ 5.69439143]]),
+            np.array([[ 2.18697549],
+                    [-4.05695451]]),
+            np.array([[-0.6036533 ],
+                    [-5.27697924]])]
+
+
+
+# %% Loop
+
+
+
+u=np.array([[0]])
+unew=np.zeros((1,1))
+
+
+breaktimes_act=[]
+breaktimes_up=[]
+breaktimes_complete=[]
+breaktimes_BKC=[]
+terminate_cond=[]
+
+skip_update_on_fail=False
+terminate_frac=(2/3)
+
+JGcat=[]
+rcat=[]
+
+rvg_cat=[]
+
+utraj_cat=[]
+xtraj_cat=[]
+xcat=[]
+ycat=[]
+ucat=[u.squeeze().tolist()]
+Jcat=[]
+ncat=[]
+ucat_n=[]
+ltR_=time.time()
+lts=time.time()
+jvb=False
+for ep in range(epmax):
+    if switch_B:
+        if ep==int(epmax/2):
+            ss.Hu=Hu0*0.1
+    rvg=[]
+    # if ep%fig_mod==0 and ep!=0:
+    #     # try:
+    #     plt.figure()
+    #     plt.plot(np.array(ycat)[-31*20:-1])
+
+
+    BKC=0
+
+    LDT=(time.time()-lts)/60
+    print('LOOP TIME:',LDT,'--------------------------------')
+    lts=time.time()
+    stt=time.time()
+    
+    if decay_dist_select:
+        x=decay_dist[ep]
+    else:
+        if di_status and dist_select:
+            x=dist[ep]
+        elif scr_status and dist_select:
+            x=dist_scr[ep]
+        elif scr_status and not dist_select:
+            x=np.array([[0.66*rand.choice([-1,1])*yub[0]*np.random.rand(),0.66*rand.choice([-1,1])*yub[1]*np.random.rand()]]).T
+            # x=np.array([[0.3*rand.choice([-1,1])*yub[0]*np.random.rand(),0.3*rand.choice([-1,1])*yub[1]*np.random.rand()]]).T
+
+        else:
+            x=np.array([[rand.choice([-1,1])*yub[0]*np.random.rand(),rand.choice([-1,1])*yub[0]*np.random.rand()]]).T
+    
+    y=np.matmul(ss.C,x)
+    ycat.append(y.squeeze().tolist())
+
+    for t in range(tfinal):
+        # stt=time.time()
+        print((ep+t/tfinal)/epmax*100,'  TIME:',time.time()-stt)
+        stt=time.time()
+        xcat.append(x.squeeze().tolist())
+        
+        if special_train or special_exp:
+            # if ep>1 and t==0:
+            #     Agent.RB.generate()
+            if ep==0 and t==29:
+                Agent.RB.generate()
+                jvb=True
+            elif ep>1 and t==0:
+                Agent.RB.generate()
+                jvb=True
+
+        if rl_status:
+            if special_exp and jvb:
+            # if special_exp and ep>1:
+                unew, nva=Agent.get_action1_2( [y_sc[0].norm(y[0].item()),y_sc[0].norm(y[1].item())] )
+                # ns_=False
+            else:
+                unew=Agent.get_action( [y_sc[0].norm(y[0].item()),y_sc[0].norm(y[1].item())] )
+                nva=True
+
+            # print(unew)
+
+            # try:
+                
+                # print('RL')
+                
+                # ytraj,unew,xtraj,J,G=t1.RL_rbf(x.squeeze(axis=1).tolist(),u.squeeze(axis=1).tolist(),0)
+                # unew=Agent.get_action( [y_sc[0].norm(y[0].item()),y_sc[0].norm(y[1].item())] )
+                # unew=Agent.get_action(y_sc[0].norm(y.item()))
+
+##############################################################################################################
+##############################################################################################################
+
+            # except:
+            #     try:
+            #         breaktimes_act.append([ep,t])
+            #         print('-------------------------------f----------------------------------')
+            #         ytraj,unew,xtraj,J,G=t1.static(x.squeeze(axis=1).tolist(),u.squeeze(axis=1).tolist(),0)
+            #     except:
+            #         print('-------------------------------ff----------------------------------')
+            #         BKC+=1
+            #         unew[0][0]=0
+        else:
+            # try:
+            #     if nlmodel:
+            #         ytraj,unew,xtraj,J,G=t1.static_nl(x.squeeze(axis=1).tolist(),u.squeeze(axis=1).tolist(),0)
+            #     else:
+            #         ytraj,unew,xtraj,J,G=t1.static(x.squeeze(axis=1).tolist(),u.squeeze(axis=1).tolist(),0)
+            # except:
+            #     unew[0][0]=0
+                # print('-------------------------------f----------------------------------')
+            print('-------------------------------f----------------------------------')
+        
+        ucat_n.append(unew)
+        # xtraj_cat.append(xtraj)
+        # utraj_cat.append(unew)
+        # JGcat.append([J,G])
+
+        if ep==(epmax-1) or noise==0 or not nva:
+            u=np.array([[u_sc[0].act(unew)]]) #needs fixed for other inputs
+            # u=np.array([[unew[0][0]]]).T #needs fixed for other inputs
+        else:
+            nois=OUA(ep*tfinal+t)
+            ncat.append(np.clip(nois,-1,1))
+            u=np.clip(np.array([[u_sc[0].act(unew)]])+u_sc[0].act(np.clip(nois,-1,1)),ulb,uub)
+            # u=np.clip(np.array([[unew[0][0]]]).T+u_sc[0].act(np.clip(nois,-1,1)),ulb,uub)
+            # u=np.clip(np.array([[unew[0][0]]]).T+du_sc[0].act(np.random.randn()*noise*(1-ep/epmax)),ulb,uub)
+        ucat.append(u.squeeze().tolist())
+
+        if scr_status and offset:
+            xp,yp, R, isdone=ss.stepmodeloffset(x,u)    
+        else:
+            xp,yp, R, isdone=ss.stepmodel(x,u)
+
+        rcat.append(R.squeeze().item())
+        rvg.append(R.squeeze().item())
+        ycat.append(yp.squeeze().tolist())
+
+        if BKC>(terminate_frac)*tfinal:
+            breaktimes_BKC.append([ep,t])
+
+        if any(xp>(yub[0]*1.1)) or any(xp<(ylb[0]*1.1)) or BKC>(terminate_frac)*tfinal:
+            u=np.array([[0]])
+            terminate_cond.append([ep,t])
+            break
+
+        
+            # t1.update(x,y,u,R,ytraj2,unew2,xtraj2,ss)
+            # t1.update_rbf(x,y,u,R,ytraj2,unew2,xtraj2,ss)
+            # print('update')
+            
+            
+        
+        if not static_nn:
+
+            p=([y_sc[0].norm(y[0].item()),y_sc[1].norm(y[1].item())],[u_sc[0].norm(u.item())],[R.item()],[y_sc[0].norm(yp[0].item()),y_sc[1].norm(yp[1].item())])
+            Agent.RB.record(p)
+
+            if special_train:
+
+                
+
+                if ep>1:
+                    Agent.RB.predict_set(np.array([[y_sc[0].norm(y[0].item())],[y_sc[1].norm(y[1].item())]]),np.expand_dims(unew,axis=(0,1)))
+                    Agent.update1_2()
+                else:
+                    Agent.update()
+            else:
+                Agent.update()
+                
+
+        if save_nn:
+            torch.save(Agent.critic,path_c1_s)
+            torch.save(Agent.critic_target,path_ct1_s)
+            torch.save(Agent.actor,path_a_s)
+            torch.save(Agent.actor_target,path_at_s)
+            
+            # path_c1_s=(pbse+'\critic1')
+            # path_ct1_s=(pbse+'\critic_target1')
+            # path_a_s=(pbse+'\actor')
+            # path_at_s=(pbse+'\actor_target')
+
+
+            
+            
+
+        
+        x=xp
+        y=yp
+        if decay_B:
+            if ((ep+t/tfinal)/(epmax/2))<1:
+                ss.Hu=Hu0*(1-((ep+t/tfinal)/(epmax/2))*0.9)
+            
+
+        
+    rvg_cat.append(np.mean(rvg))
+    print("RVG",np.mean(rvg))
+    if ep%2==0 and save_loss:
+        # timestamp=(ep)/epmax*100
+        # pfile_L=pbse + '\T' + str(timestamp)+ '.pkl'
+        pfile_L=pbse + '\Loss.pkl'
+
+        Loss=[Agent.p_L,Agent.c_L,rcat]
+        with open(pfile_L, "wb") as pkl_wb_obj:
+            pickle.dump(Loss,pkl_wb_obj)
+
+
+        # print('f')
+
+# ltR_=time.time()
+print('-------------------------------------------------')
+print('-------------------------------------------------')
+print('-------------------------------------------------')
+print('TOTAL TIME:', (time.time()-ltR_)/60, ' min')
+print('     Or    ', (time.time()-ltR_)/3600, ' hr')
+# %% Loss and reward
+loss1=Agent.c_L
+loss2=Agent.p_L
+Ml1=mov_mean(loss1,65*5)
+Ml2=mov_mean(loss2,65*5)
+    
+rvg=mov_med(rcat,65*3)
+
+plt.figure()
+plt.plot(Agent.c_L)
+plt.plot(Ml1)
+plt.title('Critic')
+plt.figure()
+plt.plot(Agent.p_L)
+plt.plot(Ml2)
+plt.title('Actor')
+
+plt.figure()
+plt.plot(rcat)
+plt.plot(rvg)
+
+plt.figure()
+plt.hist(Agent.RB.catalog)
+# %% state
+
+plt.figure()
+plt.plot(ycat)
+plt.title('states')
+
+plt.figure()
+plt.plot(ucat)
+plt.title('actions')
+
+print(np.mean(rvg_cat))
+print(np.sum(rcat))
+
+# %% noise and action normalized
+
+plt.figure()
+plt.plot(ucat_n)
+plt.figure()
+plt.plot(ncat)
+
+
+# %% 10 last episode
+
+plt.figure()
+plt.plot(xcat[tfinal*-10:-1])
+# plt.xlim([tfinal*-10,-1])
+plt.figure()
+plt.plot(ucat[tfinal*-10:-1])
+
+# %% loss find
+
+# loss find
+aaa=np.array(Ml1)
+print(aaa[-1])
+bbb=np.where(aaa<=aaa[-1]*1.1)[0][0:100]
+print(bbb)
+
+# %% save data
+
+
+sb=Agent.RB.state_buffer
+ab=Agent.RB.action_buffer
+rb=Agent.RB.reward_buffer
+ssb=Agent.RB.next_state_buffer
+
+# sb2=np.concatenate(sb).squeeze(1)
+# ab2=np.concatenate(ab).squeeze(1)
+# rb2=np.concatenate(rb).squeeze(1)
+# ssb2=np.concatenate(ssb).squeeze(1)
+
+# buffile=np.concatenate((sb2,ab2,rb2,ssb2),1)
+
+buffile=np.concatenate((sb,ab,rb,ssb),1)
+
+# nam_con="ep_100_12202024_siso"
+# nam_con="ep_1000_12202024_siso"
+
+# nam_con="ep_500_01122025_miso_good"
+# nam_con="ep_500_01122025_miso_ok"
+
+# nam_con="ep_500_01132025_special_train"
+# nam_con="ep_500_01132025_special_train_standard"
+
+
+# nam_con="ep_500_01132025_loadbuff_special_train"
+# nam_con="ep_500_01132025_loadbuff_special_train_standard"
+
+
+
+# nam_con="ep_500_01132025_reward_focus_special_train"
+# nam_con="ep_500_01132025_reward_focus_special_train_strandard"
+# nam_con="ep_500_01182025_special exploration"
+
+
+# nam_con="ep_500_01212025_standard_10grp"
+# nam_con="ep_500_01212025_reward_10grp"
+# nam_con="ep_500_01212025_explore_10grp"
+nam_con="ep_500_01212025_both_10grp"
+
+
+datfile=[xcat, ycat, ucat, rcat, rvg_cat, loss1,loss2]
+
+if save_data:
+    pfile=(r"G:\My Drive\Python Scripts\conf_set\data\buffile_"+nam_con+".pkl")
+    with open(pfile, "wb") as pkl_wb_obj:
+        pickle.dump(buffile,pkl_wb_obj)
+    
+    pfile=(r"G:\My Drive\Python Scripts\conf_set\data\datfile_"+nam_con+".pkl")
+    with open(pfile, "wb") as pkl_wb_obj:
+        pickle.dump(datfile,pkl_wb_obj)
+
+#     pfile2=(r"G:\My Drive\Python Scripts\VMPC\vmpc_new_set_102124\data\setfile_"+nam_con+".pkl")
+#     with open(pfile2, "wb") as pkl_wb_obj:
+#         pickle.dump(setfile,pkl_wb_obj)
+    
+
+
+
+# %%nopenbuffer
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import LogNorm
+
+from sklearn import mixture
+
+# nam_con="ep_100_12202024_siso"
+nam_con="ep_1000_12202024_siso"
+pfile=(r"G:\My Drive\Python Scripts\conf_set\data\buffile_"+nam_con+".pkl")
+with open(pfile, "rb") as pkl_rb_obj:
+        buffile = pickle.load(pkl_rb_obj)  
+
+
+data=buffile
+
+# sb=Agent.RB.state_buffer
+# ab=Agent.RB.action_buffer
+# rb=Agent.RB.reward_buffer
+# ssb=Agent.RB.next_state_buffer
+
+
+
+# sb2=np.concatenate(sb).squeeze(1)
+# ab2=np.concatenate(ab).squeeze(1)
+# rb2=np.concatenate(rb).squeeze(1)
+# ssb2=np.concatenate(ssb).squeeze(1)
+
+# data=np.concatenate((sb2,ab2,rb2,ssb2),1)
+# # data=np.concatenate((sb2,ab2,rb2),1)
+
+# %%
+# data2=data[:,0:3]
+# clf = mixture.GaussianMixture(n_components=9, covariance_type="full")
+# clf.fit(data2)
+# # clf.fit(data[:,0:2])
+
+clf2=Agent.RB.exp
+data2=Agent.RB.data[:,0:3]
+data=Agent.RB.data
+
+# clf=mixture.GaussianMixture(n_components=7, covariance_type="full")
+# clf.fit(data2)
+
+# 0,1 state   2 action    3 reward
+
+# x = np.linspace(-1, 1)
+# y = np.linspace(-1, 1)
+# r = np.linspace(0, 2)
+# X, Y, R = np.meshgrid(x, y, r)
+# # XX = np.array([X.ravel(), Y.ravel(), R.ravel(), X.ravel()]).T
+# XX = np.array([X.ravel(), Y.ravel(), R.ravel()]).T
+# Z = -clf.score_samples(XX)
+# Z = Z.reshape(X.shape)
+
+# CS = plt.contour(
+#     X, Y, Z[:,:,0], norm=LogNorm(vmin=1.0, vmax=1000.0), levels=np.logspace(0, 3, 10)
+# )
+# CB = plt.colorbar(CS, shrink=0.8, extend="both")
+# plt.scatter(data[:, 0], data[:, 1], 0.8)
+
+# plt.title("Negative log-likelihood predicted by a GMM")
+# plt.axis("tight")
+# plt.show()
+# colors=["blue","orange","green","red","purple","black","yellow","cyan","grey"]
+colors=["blue","orange","green","red","purple","black","yellow"]
+plt.figure()
+plt.xlabel('state')
+plt.ylabel('action')
+tempR=[]
+tempa=[]
+for i, color in enumerate(colors):
+    # plt.plot()
+    dsub = data[clf.predict(data2) == i]
+    plt.scatter(dsub[:, 0], dsub[:, 3], color=color, marker="x")
+    tempR.append([color,np.mean(dsub[:,3]),dsub[:,3]])
+    tempa.append([color,np.mean(dsub[:,2]),dsub[:,2]])
+    print(color)
+    print(np.mean(dsub[:,3]))
+    print(np.std(dsub[:,3]))
+    print('--------------------------------------------')
+    
+# %%
+
+# f=np.histogram(temp[0][2])
+for i,k in enumerate(tempR):
+    # print(i)
+    # print(k)
+    plt.figure()
+    plt.hist(k[2],label=k[0],color=k[0])
+    plt.legend()
+# %%
+for i,k in enumerate(tempa):
+    # print(i)
+    # print(k)
+    plt.figure()
+    plt.hist(k[2],label=k[0],color=k[0])
+    plt.legend()
+# %% Reset
+# X, Y, R = np.meshgrid(x, y, r)
+del GR
+del GnR
+# %% Start Here
+nc=8
+end=12000
+data=Agent.RB.data
+data2=Agent.RB.data[:,0:3] #no rewards
+data2_full=Agent.RB.data[:,0:3] #no rewards
+data3=Agent.RB.data[:,0:4]  #rewards
+data3_full=Agent.RB.data[:,0:4]  #rewards
+GnR=mixture.GaussianMixture(n_components=nc, covariance_type="full")
+GnR.fit(data2)
+# GR=mixture.GaussianMixture(n_components=6, covariance_type="tied")
+GR=mixture.BayesianGaussianMixture(n_components=6, covariance_type="tied", max_iter=1000 ) #init_params="random"
+GR.fit(data3)
+# full tied speherical diag
+
+# %%
+data=Agent.RB.data
+data2=Agent.RB.data[:,0:3] #no rewards
+data2_full=Agent.RB.data[:,0:3] #no rewards
+data3=Agent.RB.data[:,0:4]  #rewards
+data3_full=Agent.RB.data[:,0:4]  #rewards
+GnR=Agent.RB.exp
+GR=Agent.RB.clf
+
+# %%
+tempR=[]
+tempA=[]
+        
+for i in range(GnR.means_.shape[0]):
+    # plt.plot()
+    dsub =data3[GnR.predict(data2) == i]
+    # plt.scatter(dsub[:, 0], dsub[:, 2], color=color, marker="x")
+    tempR.append([i,np.mean(dsub[:,3]),np.std(dsub[:,3])])
+    tempA.append([i,np.mean(dsub[:,2]),np.std(dsub[:,2])])
+
+
+
+K=[]
+Entropy=[]
+ExpR=[]
+B1=GnR.predict_proba(data2)
+for i in B1:
+    # print(i.shape)
+    # print(np.max(i))
+    k2=np.max(i)
+    H=0
+    R_=0
+    for grp,s in enumerate(i):
+        
+        R_=R_+s*tempR[grp][1]
+        if s <1e-6:
+            H=H+0
+        else:
+            H=H-s*np.log2(s)
+    Entropy.append(H)
+    ExpR.append(R_)
+    # B1.shape
+    # np.append(K,kkk)
+    K.append(k2)
+
+test=np.concatenate((data2,np.array([ExpR]).T),1)
+# plt.hist(K)
+# plt.hist(Entropy)
+
+out=GR.predict(test)
+outT=GR.predict(data3)
+
+plt.figure()
+plt.plot(data3_full[:,3])
+plt.plot(test[:,3])
+plt.title("Expect reward based of GnR vs True")
+
+plt.figure()
+plt.hist(Entropy)
+plt.title("Entropy from GnR")
+
+
+
+# %%
+tprb=GR.predict_proba(test)
+
+num=[]
+Entropy=[]
+ExpR=[]
+
+be1=[]
+be2=[]
+be3=[]
+ce1=[]
+ce2=[]
+ce3=[]
+
+count=[]
+count2=[]
+for i,k in enumerate(tprb):
+    H=0
+    R_=0
+    for grp,s in enumerate(k):
+        # R_=R_+s*tempR[grp][1]
+        if s <1e-6:
+            H=H+0
+        else:
+            H=H-s*np.log2(s)
+    Entropy.append(H)
+    ExpR.append(R_)
+    num.append(out[i]-outT[i])
+    if out[i]-outT[i]==0:
+        be1.append(out[i]-outT[i])
+        be2.append(H)
+        be3.append(R_)
+        count2.append(i)
+    else:
+        ce1.append(out[i]-outT[i])
+        ce2.append(H)
+        ce3.append(R_)
+        count.append(i)
+        
+
+print(len(be1)/len(test))
+
+# %%
+
+plt.figure()
+plt.hist(be2, color="C1", label="match")
+plt.hist(ce2, color="C0", label="no match")
+
+
+# plt.hist(be2, color="C1", label="match")
+plt.title('entropy if match vs no match')
+plt.legend()
+
+plt.figure()
+plt.plot(data3_full[:,3])
+plt.plot(ExpR)
+plt.title('rewards expected vs actual')
+
+# %% skip
+# dontr agree
+EvR=[]
+EvR2=[]
+for i,k in enumerate(ce2):
+    # if k>np.mean(ce2):
+    if k<.1:
+        EvR.append(ce3[i])
+        EvR2.append(data3[count[i],3])
+
+# plt.figure()
+# plt.plot(EvR2)
+# plt.plot(EvR)
+
+print(np.mean(abs(np.array(EvR)-np.array(EvR2))))
+
+plt.figure()
+plt.hist(EvR2)
+
+# %% skip
+# Agree
+EvR=[]
+EvR2=[]
+for i,k in enumerate(be2):
+    # if k>np.mean(ce2):
+    # if 0.001<k<0.1:
+    if k<0.01:
+    # if k<0.1:
+        EvR.append(be3[i])
+        EvR2.append(data3[count2[i],3])
+
+# plt.figure()
+# plt.plot(EvR2)
+# plt.plot(EvR)
+
+print(np.mean(abs(np.array(EvR)-np.array(EvR2))))
+plt.figure()
+plt.hist(EvR2)
+# %% skip
+# Dont agree
+EvR=[]
+EvR2=[]
+for i,k in enumerate(ce2):
+    # if k>np.mean(ce2):
+    if k>0.99:
+        EvR.append(ce3[i])
+        EvR2.append(data3[count[i],3])
+
+# plt.figure()
+# plt.plot(EvR2)
+# plt.plot(EvR)
+
+print(np.mean(abs(np.array(EvR)-np.array(EvR2))))
+plt.figure()
+plt.hist(EvR2)
+# %% skip
+# Agree
+EvR=[]
+EvR2=[]
+for i,k in enumerate(be2):
+    # if k>np.mean(be2):
+    if k>0.99:
+        EvR.append(be3[i])
+        EvR2.append(data3[count2[i],3])
+
+# plt.figure()
+# plt.plot(EvR2)
+# plt.plot(EvR)
+
+print(np.mean(abs(np.array(EvR)-np.array(EvR2))))
+plt.figure()
+plt.hist(EvR2)
+# %% skip
+
+EvR=[]
+EvR2=[]
+for i,k in enumerate(Entropy):
+    # if k>np.mean(be2):
+    if k>0.5 and k<0.9:
+        EvR.append(ExpR[i])
+        EvR2.append(data3[i,3])
+
+# plt.figure()
+# plt.plot(EvR2)
+# plt.plot(EvR)
+
+print(np.mean(abs(np.array(EvR)-np.array(EvR2))))
+
+
+
+
+
+
+
+# %% NEXT
+Entropy=[]
+ExpR=[]
+B1=GR.predict_proba(data3_full)
+for i in B1:
+    # print(i.shape)
+    # print(np.max(i))
+    k2=np.max(i)
+    H=0
+    R_=0
+    for grp,s in enumerate(i):
+        
+        R_=R_+s*tempR[grp][1]
+        if s <1e-6:
+            H=H+0
+        else:
+            H=H-s*np.log2(s)
+    Entropy.append(H)
+    ExpR.append(R_)
+    # B1.shape
+    # np.append(K,kkk)
+    K.append(k2)
+
+# test=np.concatenate((data2,np.array([ExpR]).T),1)
+# plt.hist(K)
+
+
+# out=GR.predict(test)
+# outT=GR.predict(data3_full)
+
+plt.figure()
+plt.hist(K)
+plt.figure()
+plt.hist(Entropy)
+plt.title("entropy gr")
+
+# %%
+tempR=[]
+tempA=[]
+EntCat=[]
+ExpRCat=[]    
+for i in range((GR.means_.shape[0])):
+    # plt.plot()
+    dsub =data3[GR.predict(data3_full) == i]
+    # plt.scatter(dsub[:, 0], dsub[:, 2], color=color, marker="x")
+    tempR.append([i,np.mean(dsub[:,3]),np.std(dsub[:,3]),len(dsub)])
+    # tempA.append([i,np.mean(dsub[:,2]),np.std(dsub[:,2])])
+    
+    
+for i in range((GR.means_.shape[0])):
+    dsub =data3[GR.predict(data3_full) == i]
+    B1=GR.predict_proba(dsub)
+    Entropy=[]
+    ExpR=[]
+    for f in B1:
+        
+        k2=np.max(f)
+        H=0
+        R_=0
+        for grp,s in enumerate(f):
+            
+            R_=R_+s*tempR[grp][1]
+            if s <1e-6:
+                H=H+0
+            else:
+                H=H-s*np.log2(s)
+        Entropy.append(H)
+        ExpR.append(R_)
+        # B1.shape
+        # np.append(K,kkk)
+        K.append(k2)
+    EntCat.append([Entropy,i])
+    ExpRCat.append([ExpR,i])
+
+# print(tempR)
+# %%
+for k,i in enumerate(EntCat):
+    plt.figure()
+    plt.hist(i[0])
+    plt.title(i[1])
+    plt.figure()
+    plt.hist(ExpRCat[k][0], color="C1")
+    plt.title(i[1])
+
+# for i in ExpRCat:
+#     plt.figure()
+#     plt.hist(i[0])
+#     plt.title(i[1])
+
+
+# %%
+
+
+colors=["blue","orange","green","red","purple","black","yellow","cyan","grey",
+        "brown","coral","beige", "skyblue","violet","crimson","orchid"]
+plt.figure()
+plt.xlabel('state')
+plt.ylabel('action')
+tempR=[]
+tempa=[]
+for i, color in enumerate(colors):
+    # plt.plot()
+    dsub = data3_full[GR.predict(data3_full) == i]
+    plt.scatter(dsub[:, 1], dsub[:, 2], color=color, marker="x")
+    tempR.append([color,np.mean(dsub[:,3]),dsub[:,3]])
+    tempa.append([color,np.mean(dsub[:,2]),dsub[:,2]])
+    print(color)
+    print(np.mean(dsub[:,3]))
+    print(np.std(dsub[:,3]))
+    print('--------------------------------------------')
+# %%
