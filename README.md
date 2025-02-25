@@ -6,8 +6,12 @@ There was discussion at a point in my research where it was thought I may need c
 
 ## RL_CPC
 The folder RL_CPC contains the code used for the  publication "Development of algorithms for augmenting and replacing conventional process control using reinforcement learning":
+
 https://www.sciencedirect.com/science/article/abs/pii/S0098135424002448
-This code is probably the most disorganized given the number of situations and circumstances I needed to model. Fot that, I apologize. It uses a custom virtual environment based on the IDAES package as well as pyomo and pytorch. There are two files, one containing simulation of a flow sheet of a solid oxide fuel cell, and the other of a continuous stirred tank reactor. In both cases, I needed to simulate conventional control, reinforcement learning control, and dynamic modelling of the system under a number of different disturbances and scenarios.
+
+This code is probably the most disorganized given the number of situations and circumstances I needed to model. For that, I apologize. It uses a custom virtual environment based on the IDAES package as well as pyomo and pytorch. There are two files, one containing simulation of a flow sheet of a solid oxide fuel cell, and the other of a continuous stirred tank reactor. In both cases, I needed to simulate conventional control, reinforcement learning control, and dynamic modelling of the system under a number of different disturbances and scenarios.
+
+IDAES REPO:https://github.com/DanBeahr/idaes-pse.git
 
 ## AdvisorAlg
 The folder AdvisorAlg contains some of my most recent work. This uses state space models of a selective catalytic reduction unit as opposed to a pyomo model. Here you should be able to actually simulate without a custom virtual environment with IDAES downloaded. However, the functions that contain elements of gaussian mixture models have not quite been worked out yet, so I enourage disabling the special_train and special_exp options if you wish to try see the code in action for training.
