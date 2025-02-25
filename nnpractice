@@ -1,0 +1,93 @@
+# %%
+print('f')
+
+
+# %%
+
+# from enum import Enum
+# import pandas as pd
+# import numpy as np
+# import pyomo.environ as pyo
+
+
+# from pyomo.dae import ContinuousSet, DerivativeVar
+# import matplotlib.pyplot as plt
+# import matplotlib.ticker as mtick
+# from pyomo.dae.flatten import flatten_dae_components
+# from scipy.io import loadmat
+# # from random import sample
+# import random
+# import copy as copy
+# import torch
+# import torch.nn as nn
+# import math
+# from torch.utils.data import TensorDataset, DataLoader
+# from pyomo.environ import SolverFactory
+
+# import torch.onnx
+# import torch
+# import torch.nn as nn
+# import torch.nn.functional as F
+
+# from matplotlib.font_manager import FontProperties
+# import numpy as np
+# from numpy import random as rand
+# from matplotlib import pyplot as plt
+# import copy as copy
+# import torch
+# import torch.nn as nn
+# import math
+# import numpy as np
+# from matplotlib import pyplot as plt
+# from torch.utils.data import TensorDataset, DataLoader
+# from idaes.core.util.model_statistics import degrees_of_freedom
+# from pyomo.environ import *
+# from pyomo.environ import SolverFactory
+# from pyomo.dae import *
+# from pyomo.dae.simulator import Simulator
+# from idaes.core import FlowsheetBlock
+# import idaes.logger as idaeslog
+# import copy as copy
+# import os
+# import time
+# from enum import Enum
+# import pandas as pd
+# import numpy as np
+# import pyomo.environ as pyo
+# # from pyomo.repn.plugins import nl_writer
+# # nl_writer._activate_nl_writer_version(2)
+# from pyomo.common.fileutils import this_file_dir
+# from pyomo.common.collections import ComponentSet, ComponentMap
+# from pyomo.util.calc_var_value import calculate_variable_from_constraint
+# import idaes
+# import idaes.core.util.scaling as iscale
+# from pyomo.dae import ContinuousSet, DerivativeVar
+# from idaes.core.solvers import petsc
+# import idaes.logger as idaeslog
+# import idaes.core.util.model_serializer as ms
+# from idaes.core.util.model_statistics import degrees_of_freedom as dof
+
+# import matplotlib.pyplot as plt
+# import matplotlib.ticker as mtick
+# from idaes.models.control.controller import ControllerType, ControllerMVBoundType, ControllerAntiwindupType
+
+# from idaes.models.properties import iapws95
+# from idaes.core.util.model_statistics import degrees_of_freedom as dof
+# from pyomo.dae.flatten import flatten_dae_components
+# from scipy.io import loadmat
+# # from numpy import random as rand
+# # from random import sample
+# import random
+# import copy as copy
+# import torch
+# import torch.nn as nn
+# import math
+# from matplotlib import pyplot as plt
+# from torch.utils.data import TensorDataset, DataLoader
+# import pickle
+
+# %%
+
+
+plt.figure()
+plt.plot()

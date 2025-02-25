@@ -1,0 +1,4707 @@
+# %% Import
+# All Packages
+import os
+import time
+from enum import Enum
+import pandas as pd
+import numpy as np
+import pyomo.environ as pyo
+# from pyomo.repn.plugins import nl_writer
+# nl_writer._activate_nl_writer_version(2)
+from pyomo.common.fileutils import this_file_dir
+from pyomo.common.collections import ComponentSet, ComponentMap
+from pyomo.util.calc_var_value import calculate_variable_from_constraint
+import idaes
+import idaes.core.util.scaling as iscale
+from pyomo.dae import ContinuousSet, DerivativeVar
+from idaes.core.solvers import petsc
+import idaes.logger as idaeslog
+import idaes.core.util.model_serializer as ms
+from idaes.core.util.model_statistics import degrees_of_freedom as dof
+from soec_dynamic_flowsheet_mk2 import SoecStandaloneFlowsheet
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+from idaes.models.control.controller import ControllerType, ControllerMVBoundType, ControllerAntiwindupType
+from save_results import save_results
+from idaes.models.properties import iapws95
+from idaes.core.util.model_statistics import degrees_of_freedom as dof
+from pyomo.dae.flatten import flatten_dae_components
+from scipy.io import loadmat
+# from numpy import random as rand
+# from random import sample
+import random
+import copy as copy
+import torch
+import torch.nn as nn
+import math
+from matplotlib import pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader
+import pickle
+
+
+
+# %% Change catalog
+
+# This file has Rl use da or du as action
+# center around zero
+#%% Idaes Functions
+# Idaes Functions
+
+class OperatingScenario(Enum):
+    maximum_production = 1
+    minimum_production = 2
+    power_mode = 3
+    neutral = 4
+
+def scale_indexed_constraint(con, sf):
+    for idx, c in con.items():
+        iscale.constraint_scaling_transform(c, sf)
+
+def create_ramping_eqns(fs, vars, time_scaling_factor=1):
+    def rule_ramp(b, t, dvdt, v_ramp):
+        return dvdt[t] == v_ramp[t]
+    t0 = fs.time.first()
+
+    for var in vars:
+        var.unfix()
+        shortname = var.name.split(".")[-1]
+        blk = var.parent_block()
+        dvdt = DerivativeVar(var, wrt=fs.time, initialize=0)
+        setattr(blk, "d" + shortname + "dt", dvdt)
+        v_ramp = pyo.Var(fs.time, initialize=0)
+        setattr(blk, shortname + "_ramp_rate", v_ramp)
+        v_ramp_eqn = pyo.Constraint(fs.time, rule=lambda b, t: rule_ramp(b, t, dvdt, v_ramp))
+        setattr(blk, shortname + "_ramp_rate_eqn", v_ramp_eqn)
+        for t in fs.time:
+            sv = iscale.get_scaling_factor(var[t], default=1)
+            iscale.set_scaling_factor(dvdt[t], sv/time_scaling_factor)
+            iscale.set_scaling_factor(v_ramp[t], sv/time_scaling_factor)
+            iscale.constraint_scaling_transform(v_ramp_eqn[t], sv/time_scaling_factor)
+
+        v_ramp_eqn[t0].deactivate()
+        v_ramp[t0].fix(0)
+
+class reset_m:
+    def __init__(self):
+        self.vval=[]
+    def save(self,m):
+        regular_vars, time_vars = flatten_dae_components(m, m.fs.time, pyo.Var, active=True)
+        for var in time_vars:
+             for t in m.fs.time:
+                  self.vval.append(var[t].value)
+    def load(self,m):
+        regular_vars, time_vars = flatten_dae_components(m, m.fs.time, pyo.Var, active=True)
+        i=0
+        for var in time_vars:
+             for t in m.fs.time:
+                  var[t].value=self.vval[i]
+                  i+=1
+         
+
+# %%
+
+
+def copy_final_steady_state():
+    # Function that propogates initial steady state guess to future time points
+    # regular_vars 
+    regular_vars, time_vars = flatten_dae_components(m, m.fs.time, pyo.Var, active=True)
+    # Copy initial conditions forward
+    for var in time_vars:
+        for t in m.fs.time:
+            if t == m.fs.time.last():
+                continue
+            else:
+                var[t].value = var[m.fs.time.last()].value
+    # print(f'Copy final conditions')
+
+
+def copy_first_steady_state():
+    # Function that propogates initial steady state guess to future time points
+    # regular_vars 
+    regular_vars, time_vars = flatten_dae_components(m, m.fs.time, pyo.Var, active=True)
+    # Copy initial conditions forward
+    for var in time_vars:
+        for t in m.fs.time:
+            if t == m.fs.time.first():
+                continue
+            else:
+                var[t].value = var[m.fs.time.first()].value
+
+
+#%% Idaes Model setup
+# Idaes Model setup
+
+def set_indexed_variable_bounds(var, bounds):
+        for idx, subvar in var.items():
+            subvar.bounds = bounds
+
+
+from idaes.core.solvers import use_idaes_solver_configuration_defaults
+
+use_idaes_solver_configuration_defaults()
+idaes.cfg.ipopt.options.nlp_scaling_method = "user-scaling"
+idaes.cfg.ipopt["options"]["linear_solver"] = "ma57"
+idaes.cfg.ipopt.options.OF_ma57_automatic_scaling = "yes"
+idaes.cfg.ipopt["options"]["max_iter"] = 400
+idaes.cfg.ipopt["options"]["halt_on_ampl_error"] = "no"
+
+dynamic_simulation = True
+optimize_steady_state = True
+operating_scenario = OperatingScenario.maximum_production
+m = pyo.ConcreteModel()
+
+
+#%% RL Functions 
+# RL Functions
+
+
+class scale_fun_htan:
+    def __init__(self,low,high):
+        self.high=high
+        self.low=low
+
+        self.ka=(self.high-self.low)/2
+        self.ba=(self.high+self.low)/2
+    def act(self, anorm):
+        aact=self.ka*anorm+self.ba
+        return aact    
+    def norm(self, aact):
+        anorm=(aact-self.ba)/self.ka
+        return anorm
+    
+class scale_fun_sig:
+    def __init__(self,low,high):
+        self.high=high
+        self.low=low
+
+        self.ka=(self.high-self.low)/1
+        self.ba=self.low
+    def act(self, anorm):
+        aact=self.ka*anorm+self.ba
+        return aact    
+    def norm(self, aact):
+        anorm=(aact-self.ba)/self.ka
+        return anorm
+
+def create_scales_sig(lbs,ubs):
+    h=[]
+    for i in range(len(lbs)):
+        h.append(scale_fun_sig(lbs[i],ubs[i]))
+    return h
+
+def create_scales_tanh(lbs,ubs):
+    h=[]
+    for i in range(len(lbs)):
+        h.append(scale_fun_htan(lbs[i],ubs[i]))
+    return h
+
+class Buffer:
+    def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
+        # Number of "experiences" to store at max
+        self.buffer_capacity = buffer_capacity
+        # Num of tuples to train on.
+        self.batch_size = batch_size
+
+        # Its tells us num of times record() was called.
+        self.buffer_counter = 0
+
+        # Instead of list of tuples as the exp.replay concept go
+        # We use different np.arrays for each tuple element
+        self.state_buffer = []
+        self.action_buffer = []
+        self.reward_buffer = []
+        self.next_state_buffer = []
+        self.on = 0
+        # self.state_buffer = np.zeros((self.buffer_capacity, n_states))
+        # self.action_buffer = np.zeros((self.buffer_capacity, n_actions))
+        # self.reward_buffer = np.zeros((self.buffer_capacity, 1))
+        # self.next_state_buffer = np.zeros((self.buffer_capacity, num_states))
+
+    # Takes (s,a,r,s') obervation tuple as input
+    def record(self, obs_tuple):
+        # Set index to zero if buffer_capacity is exceeded,
+        # replacing old records
+        index = self.buffer_counter % self.buffer_capacity
+        
+        if self.buffer_counter > 0 and index==0:
+            self.on=1
+        if self.on==1:
+            self.state_buffer[index] = obs_tuple[0]
+            self.action_buffer[index] = obs_tuple[1]
+            self.reward_buffer[index] = obs_tuple[2]
+            self.next_state_buffer[index] = obs_tuple[3]
+        else:
+            self.state_buffer.append(obs_tuple[0])
+            self.action_buffer.append(obs_tuple[1])
+            self.reward_buffer.append(obs_tuple[2])
+            self.next_state_buffer.append(obs_tuple[3])
+
+        self.buffer_counter += 1
+        
+    def get_batch(self):
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if self.buffer_counter < self.batch_size:
+            states=self.state_buffer
+            actions=self.action_buffer
+            rewards=self.reward_buffer
+            next_states=self.next_state_buffer
+        else:
+            select=random.sample(range(len(self.state_buffer)),self.batch_size)
+            
+            for i in select:
+                states.append(self.state_buffer[i])
+                actions.append(self.action_buffer[i])
+                rewards.append(self.reward_buffer[i])
+                next_states.append(self.next_state_buffer[i])
+        return states, actions, rewards, next_states
+
+class policy(nn.Module):
+    def __init__(self,n_states,n_actions):
+        super(policy, self).__init__()
+        
+        self.stack=nn.Sequential(nn.Linear(n_states,100),
+                                    nn.ReLU(),
+                                    # nn.ReLU(),
+                                    # nn.ReLU(),
+                                      nn.Linear(100, 75),
+                                      nn.ReLU(),
+                                    nn.Linear(75,n_actions),
+                                    # nn.Tanh()
+                                    nn.Sigmoid()
+                                    )       
+        
+
+        # self.stack=nn.Sequential(nn.Linear(n_states,1280),
+        #                       nn.ReLU(),
+        #                       nn.Linear(1280, 128),
+        #                       nn.ReLU(),
+        #                       nn.Linear(128, 64),
+        #                       nn.ReLU(),
+        #                       nn.Linear(64,n_actions),
+        #                       nn.Tanh() #nn.Sigmoid()
+                            #   )       
+        
+    def forward(self,x):
+        y=self.stack(x)
+        return y
+        
+class Qfun(nn.Module):
+    def __init__(self, n_states, n_actions):
+        super(Qfun,self).__init__()
+        
+        self.stack1=nn.Sequential(nn.Linear(n_states,100),
+                              nn.ReLU(),
+                              nn.ReLU(),
+                            #   nn.Sigmoid(),
+                            #   nn.Linear(640, 128),
+                            #   nn.ReLU(),
+                              )
+        
+        
+        self.stack2=nn.Sequential(nn.Linear(n_actions,100),
+                              nn.ReLU(),
+                            #   nn.ReLU(),
+                            #   nn.Sigmoid(),
+                            #   nn.Linear(640, 128),
+                            #   nn.ReLU(),
+                              )
+        
+        self.stack3=nn.Sequential(nn.Linear(100*2, 100),
+                                  nn.ReLU(),
+                                  nn.ReLU(),
+                                  nn.Linear(100,1))
+        
+
+
+        # self.stack1=nn.Sequential(nn.Linear(n_states,640),
+        #                       nn.ReLU(),
+        #                       nn.Linear(640, 128),
+        #                       nn.ReLU(),
+        #                       )
+        
+        
+        # self.stack2=nn.Sequential(nn.Linear(n_actions,640),
+        #                       nn.ReLU(),
+        #                       nn.Linear(640, 128),
+        #                       nn.ReLU(),
+        #                       )
+        
+        # self.stack3=nn.Sequential(nn.Linear(128*2, 64),
+        #                           nn.ReLU(),
+        #                           nn.Linear(64,1))
+        
+    def forward(self,s,a):
+        s1=self.stack1(s)
+        a1=self.stack2(a)
+        z=torch.cat((s1,a1),len(s1.size())-1)
+        # z=torch.cat((s1,a1),1)
+        # z=torch.cat((s1,a1))
+        out=self.stack3(z)
+        return out
+
+class DDPGagent:
+    def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
+        # Params
+        self.num_states = n_states
+        self.num_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+
+        self.c_L=[]
+        self.p_L=[]
+
+        # Networks
+        self.actor = policy(self.num_states,self.num_actions)
+        self.actor_target = policy(self.num_states,self.num_actions)
+        self.critic = Qfun(self.num_states, self.num_actions)
+        self.critic_target = Qfun(self.num_states, self.num_actions)
+
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data)
+        
+        # Training
+        self.RB = Buffer(self.num_states,self.num_actions,buffer_capacity)        
+        self.critic_loss  = nn.MSELoss()
+        self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+        self.critic_opt= torch.optim.Adam(self.critic.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+    
+    def get_action(self, state):
+        state = torch.tensor([state]).float()
+        action = self.actor.forward(state)
+        action = np.squeeze(action.detach().numpy())
+        # action=np.ndarray.item(action)
+        return action
+    
+    def update(self):
+        states, actions, rewards, next_states = self.RB.get_batch()
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+        # Critic loss        
+        Qvals = self.critic.forward(states, actions)
+        next_actions = self.actor_target.forward(next_states)
+        next_Q = self.critic_target.forward(next_states, next_actions.detach())
+        Qprime = rewards + self.gamma * next_Q.detach() #added detach()
+        critic_loss = self.critic_loss(Qvals, Qprime)
+        self.c_L.append(critic_loss.detach().numpy())
+
+        #Critic Update
+        self.critic_opt.zero_grad()
+        critic_loss.backward() 
+        self.critic_opt.step()
+
+        # Actor loss
+        policy_loss = -self.critic.forward(states, self.actor.forward(states)).mean()
+        self.p_L.append(policy_loss.detach().numpy())
+
+        # Actorupdate networks     
+
+        self.actor_opt.zero_grad()
+        policy_loss.backward()
+        self.actor_opt.step()
+
+        
+
+        # update target networks 
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+
+class TD3:
+    def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0, p=2):
+        # Params
+        self.num_states = n_states
+        self.num_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+
+        self.batch_size=batch_size
+
+        self.c_L1=[]
+        self.c_L2=[]
+        self.p_L=[]
+
+        self.m=0
+        self.p=p
+
+        # Networks
+        self.actor = policy(self.num_states,self.num_actions)
+        self.actor_target = policy(self.num_states,self.num_actions)
+        self.critic1 = Qfun(self.num_states, self.num_actions)
+        self.critic_target1 = Qfun(self.num_states, self.num_actions)
+        self.critic2 = Qfun(self.num_states, self.num_actions)
+        self.critic_target2 = Qfun(self.num_states, self.num_actions)
+
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target1.parameters(), self.critic1.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target2.parameters(), self.critic2.parameters()):
+            target_param.data.copy_(param.data)
+        
+        # Training
+        self.RB = Buffer(self.num_states,self.num_actions,buffer_capacity,batch_size)        
+        self.critic_loss1  = nn.MSELoss()
+        self.critic_loss2  = nn.MSELoss()
+        self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+        self.critic_opt1= torch.optim.Adam(self.critic1.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+        self.critic_opt2= torch.optim.Adam(self.critic2.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+
+    def get_action(self, state):
+        state = torch.tensor([state]).float()
+        action = self.actor.forward(state)
+        action = np.squeeze(action.detach().numpy())
+        # action=np.ndarray.item(action)
+        return action
+    
+    def update(self):
+        states, actions, rewards, next_states = self.RB.get_batch()
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+
+
+        # Critic loss        
+        Qvals1 = self.critic1.forward(states, actions)
+        Qvals2 = self.critic2.forward(states, actions)
+        na_= self.actor_target.forward(next_states).detach()
+        next_actions = np.clip(na_ + np.clip(np.random.normal(0,0.1,na_.size()),-.1,.1) ,-1,1).float()
+
+        next_Q1 = self.critic_target1.forward(next_states, next_actions)
+        next_Q2 = self.critic_target2.forward(next_states, next_actions)
+        next_Q=torch.min(next_Q1,next_Q2)
+
+        Qprime = rewards + self.gamma * next_Q.detach()
+        critic_loss1 = self.critic_loss1(Qvals1, Qprime)
+        self.c_L1.append(critic_loss1.detach().numpy())
+        critic_loss2 = self.critic_loss2(Qvals2, Qprime)
+        self.c_L2.append(critic_loss2.detach().numpy())
+
+        #Critic Update
+        self.critic_opt1.zero_grad()
+        critic_loss1.backward() 
+        self.critic_opt1.step()
+
+        self.critic_opt2.zero_grad()
+        critic_loss2.backward() 
+        self.critic_opt2.step()
+
+        if self.m%self.p==0:
+            # Actor loss
+            policy_loss = -self.critic1.forward(states, self.actor.forward(states)).mean()
+            self.p_L.append(policy_loss.detach().numpy())
+
+            # Actorupdate networks     
+
+            self.actor_opt.zero_grad()
+            policy_loss.backward()
+            self.actor_opt.step()
+
+            for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+            for target_param, param in zip(self.critic_target1.parameters(), self.critic1.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+            for target_param, param in zip(self.critic_target2.parameters(), self.critic2.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+        
+
+        self.m+=1
+
+        # update target networks 
+        
+
+class OUActionNoise:
+    def __init__(self, mean, sigma_max=.35, sigma_min=0, theta=0.15, dt=1, decay_period=1e4, x_initial=None):
+        self.theta = theta
+        self.mean = mean
+        self.sigma = sigma_max
+        self.max_sigma=sigma_max
+        self.min_sigma=sigma_min
+        self.dt = dt
+        self.x_initial = x_initial
+        self.decay_period=decay_period
+        self.reset()
+
+    def __call__(self,t):
+        # Formula taken from https://www.wikipedia.org/wiki/Ornstein-Uhlenbeck_process.
+        x = (
+            self.x_prev
+            + self.theta * (self.mean - self.x_prev) * self.dt
+            + self.sigma * np.sqrt(self.dt) * np.random.normal(size=self.mean.shape)
+        )
+        # Store x into x_prev
+        # Makes next noise dependent on current one
+        self.x_prev = x
+        
+        
+        self.sigma = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
+        
+        return x
+
+    def reset(self):
+        if self.x_initial is not None:
+            self.x_prev = self.x_initial
+        else:
+            self.x_prev = np.zeros_like(self.mean)
+
+class beta:
+    def __init__(self,cap,phi,scls, ds=0.99, rlb_tol=0.025, cooldown=10):
+        self.cap=cap
+        # self.tolerance=1e-4
+        # self.a=0.9
+        # self.b=0.5
+        # self.c=2
+        # self.d=0.01
+        # self.discount=0
+        # self.alpha1=0.05
+        # self.alpha2=0.01
+        self.erel=1e-3
+        self.m=0
+        self.discount=ds
+
+        self.scls=scls
+        
+        
+        self.beta=1e-3
+        # self.betaP=1e-3
+        # self.bp=np.arange(0,1.01,.01)
+        # self.tau=.01
+        
+        self.E=[]
+        self.Ep=[0.0]
+        self.Er=[0.0]
+        
+        self.Em=[0.0]
+        
+        self.rlb=[0]
+        self.pb=[]
+        
+        self.Evg=0
+        self.Ervg=0
+        self.Epvg=0
+        
+        self.Emvg=0
+        
+        # self.rlbvg=0
+        # self.pbvg=0
+            
+        # self.bb=[]
+        # self.Ebad=[]
+        # self.Eup=[]
+        # self.up=[]
+        # self.Edwn=[]
+        # self.dwn=[]
+        
+        self.phi=phi
+        
+        self.betacounter=[]
+        # self.rt=0
+        # self.pt=0
+        self.f=0
+        self.i=0
+        self.rlb_tolerance=rlb_tol
+        self.cooldown=cooldown
+        
+    def beta_update(self, sp, yk, bep):#, du_RLk_1, du_PIDk_1, du_RLk, du_PIDk):
+        
+        
+        ynormk1=self.scls[0].norm(yk[0])
+        spnorm1=self.scls[0].norm(sp[0])
+        ynormk2=self.scls[1].norm(yk[1])
+        spnorm2=self.scls[1].norm(sp[1])
+        
+        enormk=abs(ynormk1-spnorm1)+abs(ynormk2-spnorm2)
+        
+    
+        
+        # ds=0.99997
+        self.Er=[x*self.discount for x in self.Er]
+        self.Ep=[x*self.discount for x in self.Ep]
+        self.Em=[x*self.discount for x in self.Em]
+        self.Ervg=np.mean(self.Er)
+        self.Epvg=np.mean(self.Ep)
+        self.Emvg=np.mean(self.Em)
+
+        if self.m/self.cap<1:
+            self.rlb.append(bep)
+            self.pb.append(1-bep)
+            self.E.append(enormk)
+            
+        else:
+            
+            self.rlb.pop(0)
+            self.rlb.append(bep)
+            self.pb.pop(0)
+            self.pb.append(1-bep)
+            self.E.pop(0)
+            self.E.append(enormk)
+
+
+
+        if bep>0.7:
+            # if len(self.Er)>=cap:
+            if len(self.Er)>=self.cap:
+                self.Er.pop(0)
+            
+            self.Er.append(enormk)
+            
+        elif bep<0.3:
+            # if len(self.Ep)>=cap:
+            if len(self.Ep)>=self.cap:
+                self.Ep.pop(0)
+            self.Ep.append(enormk)
+            
+        elif bep<0.7 and bep>0.3:
+            if len(self.Em)>=self.cap:
+                self.Em.pop(0)
+            self.Em.append(enormk)
+            
+            
+
+        self.Evg=round(np.mean(self.E),3)
+        # Estd=np.std(self.E)
+        self.Ervg=round((self.Ervg),3)
+        self.Epvg=round((self.Epvg),3)
+        self.Evg=round(np.mean(self.E),3)
+        # Estd=np.std(self.E)
+        
+        # self.rlbvg=round(np.mean(self.rlb),3)
+        # self.pbvg=round(np.mean(self.pb),3)
+        # self.rlbvg=np.clip(self.rlbvg,1e-3,1)
+        # self.pbvg=np.clip(self.pbvg,1e-3,1)    
+        
+        
+        if self.f==0 and abs(self.rlb[-1]-self.rlb[-2])>self.rlb_tolerance:
+            self.f=1
+                
+        if self.i>=self.cooldown:
+            self.f=0
+            self.i=0            
+        
+        if self.m<self.phi or self.f==1 or (self.Emvg<self.Epvg and self.Emvg< self.Ervg and bep<0.7 and bep>0.3):
+            self.beta=self.beta
+            self.i+=1
+            self.betacounter.append(0)
+
+        elif self.Epvg>self.Ervg:
+            self.beta=self.beta + 0.1*self.beta
+            self.betacounter.append(6)
+        elif self.Epvg<=self.Ervg:
+            self.beta=self.beta - 0.1*self.beta
+            self.betacounter.append(7)
+        
+        
+        # self.beta=self.beta*(1-self.tau)+ self.tau*betanew
+        self.m+=1
+        self.beta=np.clip(self.beta,1e-3,1)
+        
+        return(self.beta)
+        
+    def reset(self, beta_IV=1e-3):
+        # self.erel=erel
+        # self.Er=erel
+        # self.Ep=erel
+        # self.m=0
+        self.beta=beta_IV
+        self.betacounter=[]
+
+class PID:
+    def __init__(self,kp,ti,de,lb,ub,ainit=0):
+        self.kp=kp
+        self.ti=ti
+        self.e=0
+        self.eL=0
+        self.aL=0
+        self.aLact=ainit
+        # self.sp=sp
+        self.lb=lb
+        self.ub=ub
+        
+        self.de=de
+        
+        self.cat=[]
+        
+
+    # def action(self, y, sp):
+    #     self.eL=self.e
+    #     self.e=self.de*(sp-y)    #stable system
+    #     # self.e=-(sp-y)  #unstable model  ################################################################
+        
+    #     a=self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+    #     dA=a-self.aL
+    #     self.aL=a
+    #     return a,dA
+    # def aw_action(self, y,sp):
+        # self.eL=self.e
+        # self.e=self.de*(sp-y)
+        # a=np.clip(self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e,
+        #           self.lb,self.ub)
+        # if a==self.lb or a==self.ub:
+        #     self.e=0
+        # dA=a-self.aL
+        # self.aL=a
+        # return a,dA    
+    def awref_action(self, y,sp, uref, alast=None):
+        if alast!=None:
+            self.aLact=alast
+        self.eL=self.e
+        self.e=self.de*(sp-y)
+        asub=self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+        a=np.clip(asub+uref,self.lb,self.ub)
+        if a==self.lb or a==self.ub:
+            asub2=self.aL+self.kp*self.e - self.kp*self.eL
+            # asub2=self.aLact+self.kp*self.e - self.kp*self.eL  #first change
+        else:
+            asub2=asub
+        a2=np.clip(asub2+uref,self.lb,self.ub)
+        dA=a2-self.aLact
+        # self.aLact=a2
+        self.aL=asub2
+
+        self.cat.append([self.eL, self.e, asub, a, asub2, a2, dA, alast])
+                
+        # self.aL=asub2 #Before
+        return a2,dA    
+    
+    # def action2(self,y,sp,uref,alast=None):
+    #     if alast!=None:
+    #         self.aLact=alast
+    #     self.eL=self.e
+    #     self.e=self.de*(sp-y)
+    #     da=self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+    #     a=np.clip(da+uref+self.aLact,self.lb,self.ub)
+    #     if a==self.lb or a==self.ub:
+    #         a=np.clip(a-self.kp/self.ti*self.e,self.lb,self.ub)
+
+    # def ref_action(self, y,sp, uref):
+    #     self.eL=self.e
+    #     self.e=self.de*(sp-y)
+    #     asub=self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+    #     a=np.clip(asub+uref,self.lb,self.ub)
+    #     # if a==self.lb or a==self.ub:
+    #     #     self.e=0
+    #     dA=a-self.aL
+    #     self.aL=asub
+    #     return a,dA    
+        
+             
+    def reset(self):
+        self.e=0
+        self.eL=0
+        self.aL=0
+
+
+# %%  (Junk)
+
+# def expand(x):
+#     # [1, x, x^2, x^3, x^4]
+#     xx=np.concatenate((np.ones((1,x.size)),
+#                         x,
+#                         np.multiply(x,x),
+#                         np.multiply(x,np.multiply(x,x)),
+#                         np.multiply(np.multiply(x,x),np.multiply(x,x)),                 
+#     ),0)
+#     return xx
+# def expand_linear(x):
+#     # [1, x, x^2, x^3, x^4]
+#     xx=np.concatenate((np.ones((1,x.size)),
+#                         x),0)
+#     return xx
+# def regress(x,y):
+#     W=np.dot(np.linalg.inv(np.dot(x,x.T)),np.dot(x,y.T))
+#     return W
+
+# def grad(w, x):
+#     dx=np.array([[0, 1, 2*x, 3*x**2, 4*x**3 ]]).T
+#     G=np.dot(w.T,dx).tolist()[0]
+#     return G
+# # (1,100)
+
+# # tst=np.array([[-1, .5, 60],[-.1, .5, 59],[-.1, .5, 58],[-.1, .5, 0]])
+# # # tst[:,-1]
+# # for i,j in enumerate(tst[:,-1]):
+# #     # print(i)
+# #     # print(j)
+# #     if j==0:
+# #         tst=np.delete(tst,i,0)
+# # print(tst)        
+# # np.append(tst,np.array([[1,1,1]]),0)
+# # tst[tst[:,1]<0.6][:,0].mean()
+# # tst[:,0:1]=tst[:,0:1]*.99
+# # tst[:,-1:]=tst[:,-1:]-1
+# # if tst[0.2>tst[:,1]][:,1].size>=3:
+# #     tst=np.delete(tst,np.where(0.2>tst[:,1])[0][0],0)
+
+# class beta2:
+#     def __init__(self, scls, betastart=0, cap=60, phi=60, phi2=60, Timer=60, ds=1, step=0.02, rlb_tol=0.025, cooldown=1, baseerror=0.02, bounds=[0.3,0.7]):
+        
+#         self.b0=betastart
+#         self.lb=bounds[0]
+#         self.ub=bounds[1]
+#         self.beta=betastart
+#         self.m=0
+#         self.BE=baseerror
+
+#         self.scls=scls      
+        
+#         # self.cat=np.array([[0.02, 1, 300]])
+#         self.cat=np.array([[0, 0, 1]])
+
+#         self.rlb=[betastart]
+#         self.Gcat=[]
+#         self.Wcat=[]
+        
+#         self.Ervg=0
+#         self.Epvg=0
+#         self.Emvg=0
+        
+#         # Buffer capactity
+#         self.cap=cap
+#         self.discount=ds
+#         self.time=Timer
+#         # sufficient learning parameter
+#         self.phi=phi
+#         self.phi2=phi2
+        
+#         # catalog
+#         self.betacounter=[]
+       
+#     #    Cooldown stuff
+#         self.f=0
+#         self.i=0
+#         self.rlb_tolerance=rlb_tol
+#         self.step=step
+#         self.cooldown=cooldown
+        
+#     def beta_update(self, sp, yk, bep):
+        
+        
+#         ynormk1=self.scls[0].norm(yk[0])
+#         spnorm1=self.scls[0].norm(sp[0])
+#         ynormk2=self.scls[1].norm(yk[1])
+#         spnorm2=self.scls[1].norm(sp[1])
+        
+#         enormk=abs(ynormk1-spnorm1)+abs(ynormk2-spnorm2)
+#         self.cat[:,-1:]=self.cat[:,-1:]-1
+#         self.cat=np.append(self.cat,np.array([[enormk, bep, self.time]]),0)
+#         for i,j in enumerate(self.cat[:,-1]):
+#             if j==0:
+#                 self.cat=np.delete(self.cat,i,0)
+        
+#         if self.cat[self.cat[:,1]<=self.lb][:,1].size>=self.cap:
+#             self.cat=np.delete(self.cat,np.where(self.lb>=self.cat[:,1])[0][0],0)
+#         if self.cat[self.cat[:,1]>=self.ub][:,1].size>=self.cap:
+#             self.cat=np.delete(self.cat,np.where(self.ub<=self.cat[:,1])[0][0],0)
+#         if self.cat[(self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub) ][:,1].size>=self.cap:
+#             self.cat=np.delete(self.cat,np.where((self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub))[0][0],0)
+#         # tst[:,0:1]=tst[:,0:1]*.99
+#         self.cat[:,0:1]=self.cat[:,0:1]*self.discount
+        
+#         self.Ervg=self.cat[self.cat[:,1]>=self.ub][:,0].mean()
+#         self.Epvg=self.cat[self.cat[:,1]<=self.lb][:,0].mean()
+#         self.Emvg=self.cat[(self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub) ][:,0].mean()
+#         if np.isnan(self.Ervg):
+#             self.Ervg=self.BE
+#         if np.isnan(self.Epvg):
+#             self.Epvg=self.BE
+#         if np.isnan(self.Emvg):
+#             self.Emvg=self.BE
+        
+
+      
+#         xx=expand(self.cat[:,1:2].T)
+#         try:
+#             W=regress(xx,self.cat[:,0:1].T)
+#             G=grad(W,bep)[0]
+#             self.Gcat.append(G)
+#             self.Wcat.append(W.T.tolist())
+#             self.GRADon=0.5
+#         except:
+#             self.GRADon=0
+#             # self.betacounter.append(999)
+        
+#         if self.GRADon==0.5:
+#             alpha=1
+#             for i in range(10):
+#                 P=np.clip(self.beta-G*alpha,0,1)
+#                 J=np.dot(W.T,expand(np.array([[P]])))
+#                 J2=np.dot(W.T,expand(np.array([[bep]])))
+#                 if J<J2: #and J>=0:
+#                     self.GRADon=1
+#                     break
+#                 elif i==range(10)[-1]:
+#                     self.GRADon=0
+#                     print('failedLS')
+#                 else:
+#                     alpha=alpha*0.5
+    
+        
+
+#         # if self.GRADon==0.5:
+#         #     xtest=np.array([np.linspace(0,1,100)])
+#         #     xxtest=expand(xtest)
+#         #     ytest=np.dot(W.T,xxtest)
+#         #     P=xtest[:,np.argmin(ytest[-1])].item()
+#         #     self.GRADon=1
+
+#         self.rlb.append(bep)
+
+
+
+#         self.Ervg=round((self.Ervg),3)
+#         self.Epvg=round((self.Epvg),3)
+#         self.Emvg=round((self.Emvg),3)
+
+
+
+#         if self.f==0 and abs(self.rlb[-1]-self.rlb[-2])>self.rlb_tolerance:
+#             self.f=1
+                
+#         if self.i>=self.cooldown:
+#             self.f=0
+#             self.i=0            
+        
+#         if self.f==1 or self.m<self.phi:
+#             self.beta=self.beta
+#             if self.f==1:
+#                 self.i+=1
+#             self.betacounter.append(0)
+
+        
+
+#         elif self.m<self.phi2 or self.GRADon==0:
+
+#             if self.Emvg<self.Epvg and self.Emvg< self.Ervg and bep<self.ub and bep>self.lb:
+#                 self.beta=self.beta
+#                 # self.betacounter.append(1)
+#                 if self.GRADon==0:
+#                     self.betacounter.append(11)
+#                 else:
+#                     self.betacounter.append(1)
+#             elif self.Epvg>self.Ervg:
+#                 self.beta=self.beta + self.step # 0.1*self.beta
+#                 # self.betacounter.append(2)
+#                 if self.GRADon==0:
+#                     self.betacounter.append(22)
+#                 else:
+#                     self.betacounter.append(2)
+#             elif self.Epvg<=self.Ervg:
+#                 self.beta=self.beta - self.step #0.1*self.beta
+#                 # self.betacounter.append(3)
+#                 if self.GRADon==0:
+#                     self.betacounter.append(33)
+#                 else:
+#                     self.betacounter.append(3)
+        
+#         elif self.GRADon==1:
+#             if P>self.ub:
+#                 self.beta=P+self.step
+#             elif P<self.lb:
+#                 self.beta=P-self.step
+#             else:
+#                 self.beta=P
+#             # self.beta=self.beta-G *.01  
+#             self.betacounter.append(4)
+
+#         # self.beta=self.beta*(1-self.tau)+ self.tau*betanew
+#         self.m+=1
+#         self.beta=np.clip(self.beta,0,1)
+        
+#         return(self.beta)
+        
+#     def reset(self):
+        
+#         self.beta=self.b0
+#         self.betacounter=[]
+
+
+# class beta3:
+    # def __init__(self, scls, betastart=0, cap=60, capL=60, phi=60, phi2=60, Timer=60, TimerL=300, ds=1, step=0.02, rlb_tol=0.025, cooldown=1, baseerror=0.02, bounds=[0.3,0.7]):
+    #     self.clock=[]
+    #     self.b0=betastart
+    #     self.lb=bounds[0]
+    #     self.ub=bounds[1]
+    #     self.beta=betastart
+    #     self.m=0
+    #     self.BE=baseerror
+
+    #     self.scls=scls      
+        
+    #     # self.cat=np.array([[0.02, 1, 300]])
+    #     self.cat=np.array([[0, 0, 1]])
+    #     self.catL=np.array([[0, 0, 1]])
+
+    #     self.rlb=[betastart]
+    #     self.Gcat=[]
+    #     self.Wcat=[]
+    #     self.Mcat=[]
+        
+    #     self.Ervg=0
+    #     self.Epvg=0
+    #     self.Emvg=0
+        
+    #     # Buffer capactity
+    #     self.cap=cap
+    #     self.capL=capL
+    #     self.discount=ds
+    #     self.time=Timer
+    #     self.timeL=TimerL
+
+    #     # sufficient learning parameter
+    #     self.phi=phi
+    #     self.phi2=phi2
+        
+    #     # catalog
+    #     self.betacounter=[]
+    #     self.lookback=[]
+       
+    # #    Cooldown stuff
+    #     self.f=0
+    #     self.i=0
+    #     self.rlb_tolerance=rlb_tol
+    #     self.step=step
+    #     self.cooldown=cooldown
+        
+    # def beta_update(self, sp, yk, bep):
+        
+        
+    #     ynormk1=self.scls[0].norm(yk[0])
+    #     spnorm1=self.scls[0].norm(sp[0])
+    #     ynormk2=self.scls[1].norm(yk[1])
+    #     spnorm2=self.scls[1].norm(sp[1])
+        
+    #     enormk=abs(ynormk1-spnorm1)+abs(ynormk2-spnorm2)
+    #     self.cat[:,-1:]=self.cat[:,-1:]-1
+    #     self.catL[:,-1:]=self.catL[:,-1:]-1
+    #     self.cat=np.append(self.cat,np.array([[enormk, bep, self.time]]),0)
+    #     self.catL=np.append(self.catL,np.array([[enormk, bep, self.timeL]]),0)
+
+    #     subs=[]
+    #     for i,j in enumerate(self.cat[:,-1]):
+    #         if j<=0:
+    #             subs.append(i)
+    #     for i in reversed(subs):
+    #         self.cat=np.delete(self.cat,i,0)
+
+    #     subs=[]
+    #     for i,j in enumerate(self.catL[:,-1]):
+    #         if j<=0:
+    #             subs.append(i)
+    #     for i in reversed(subs):
+    #         self.catL=np.delete(self.catL,i,0)
+        
+    #     if self.cat[self.cat[:,1]<=self.lb][:,1].size>=self.cap:
+    #         self.cat=np.delete(self.cat,np.where(self.lb>=self.cat[:,1])[0][0],0)
+    #     if self.cat[self.cat[:,1]>=self.ub][:,1].size>=self.cap:
+    #         self.cat=np.delete(self.cat,np.where(self.ub<=self.cat[:,1])[0][0],0)
+    #     if self.cat[(self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub) ][:,1].size>=self.cap:
+    #         self.cat=np.delete(self.cat,np.where((self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub))[0][0],0)
+
+    #     if self.catL[self.catL[:,1]<=self.lb][:,1].size>=self.capL:
+    #         self.catL=np.delete(self.catL,np.where(self.lb>=self.catL[:,1])[0][0],0)
+    #     if self.catL[self.catL[:,1]>=self.ub][:,1].size>=self.capL:
+    #         self.catL=np.delete(self.catL,np.where(self.ub<=self.catL[:,1])[0][0],0)
+    #     if self.catL[(self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub) ][:,1].size>=self.capL:
+    #         self.catL=np.delete(self.catL,np.where((self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub))[0][0],0)
+        
+    #     # self.cat[:,0:1]=self.cat[:,0:1]*self.discount
+    #     # self.catL[:,0:1]=self.catL[:,0:1]*self.discount
+    #     if self.Ervg>self.BE:
+    #         self.catL[:,0:1]=np.where(self.catL[:,1:2]>=self.ub, self.catL[:,0:1]*self.discount,self.catL[:,0:1])  
+    #     if self.Epvg>self.BE:
+    #         self.catL[:,0:1]=np.where(self.catL[:,1:2]<=self.lb, self.catL[:,0:1]*self.discount,self.catL[:,0:1])  
+    #     if self.Emvg>self.BE:
+    #         self.catL[:,0:1]=np.where((self.lb<self.catL[:,1:2]) & (self.catL[:,1:2]<self.ub),self.catL[:,0:1]*self.discount,self.catL[:,0:1])
+        
+    #     self.Ervg=self.catL[self.catL[:,1]>=self.ub][:,0].mean()
+    #     self.Epvg=self.catL[self.catL[:,1]<=self.lb][:,0].mean()
+    #     self.Emvg=self.catL[(self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub) ][:,0].mean()
+    #     if np.isnan(self.Ervg):
+    #         self.Ervg=self.BE
+    #         self.catL=np.append(self.catL,np.array([[self.BE, self.ub+(1.0-self.ub)/2, 1]]),0)
+    #     if np.isnan(self.Epvg):
+    #         self.Epvg=self.BE
+    #         self.catL=np.append(self.catL,np.array([[self.BE, 0.0+(self.lb-0.0)/2, 1]]),0)
+    #     if np.isnan(self.Emvg):
+    #         self.Emvg=self.BE
+    #         self.catL=np.append(self.catL,np.array([[self.BE, self.lb+(self.ub-self.lb)/2, 1]]),0)
+       
+    #     if len(self.cat[self.cat[:,1]>=self.ub][:,0])==0:
+    #         self.cat=np.append(self.cat,np.array([[self.Ervg, self.ub+(1.0-self.ub)/2, 1]]),0)
+    #     if len(self.cat[self.cat[:,1]<=self.lb][:,0])==0:    
+    #         self.cat=np.append(self.cat,np.array([[self.Epvg, 0.0+(self.lb-0.0)/2, 1]]),0)
+    #     if len(self.cat[(self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub) ][:,0])==0:
+    #         self.cat=np.append(self.cat,np.array([[self.Emvg, self.lb+(self.ub-self.lb)/2, 1]]),0)
+      
+    #     xx=expand(self.cat[:,1:2].T)
+    #     avg=np.array([[ self.Epvg, 0.0+(self.lb-0.0)/2],
+    #                     [ self.Ervg, self.ub+(1.0-self.ub)/2]])
+    #     xxL=expand_linear(avg[:,1:2].T)
+    #     M=regress(xxL,avg[:,0:1].T)
+    #     self.Mcat.append(M)
+    #     try:
+    #         W=regress(xx,self.cat[:,0:1].T)
+    #         G=grad(W,bep)[0]
+    #         self.Gcat.append(G)
+    #         self.Wcat.append(W.T.tolist())
+    #         self.GRADon=0.5
+    #         self.clock.append(self.m)
+    #     except:
+    #         self.GRADon=0
+    #         print('failedRG')
+    #         # self.betacounter.append(999)
+        
+        
+        
+    #     if self.GRADon==0.5:
+    #         alpha=1
+    #         if ((M[-1]>0 and G>0) or (M[-1]<0 and G<0)):              
+    #             for i in range(10):
+    #                 P=np.clip(self.beta-G*alpha,0,1)
+    #                 J=np.dot(W.T,expand(np.array([[P]])))
+    #                 J2=np.dot(W.T,expand(np.array([[bep]])))
+    #                 if J<J2: #and J>=0:
+    #                     self.GRADon=1
+    #                     break
+    #                 elif i==range(10)[-1]:
+    #                     self.GRADon=0
+                        
+    #                     print('failedLS')
+    #                 else:
+    #                     alpha=alpha*0.5
+    #         else:
+    #             self.GRADon=0
+                
+    #             print('slope disagree')
+    
+        
+
+    #     # if self.GRADon==0.5:
+    #     #     xtest=np.array([np.linspace(0,1,100)])
+    #     #     xxtest=expand(xtest)
+    #     #     ytest=np.dot(W.T,xxtest)
+    #     #     P=xtest[:,np.argmin(ytest[-1])].item()
+    #     #     self.GRADon=1
+
+    #     self.rlb.append(bep)
+
+
+    #     self.lookback.append([self.Epvg,self.Emvg,self.Ervg,self.m])
+    #     self.Ervg=round((self.Ervg),3)
+    #     self.Epvg=round((self.Epvg),3)
+    #     self.Emvg=round((self.Emvg),3)
+
+
+
+    #     if self.f==0 and abs(self.rlb[-1]-self.rlb[-2])>self.rlb_tolerance:
+    #         self.f=1
+                
+    #     if self.i>=self.cooldown:
+    #         self.f=0
+    #         self.i=0            
+        
+    #     if self.f==1 or self.m<self.phi:
+    #         self.beta=self.beta
+    #         if self.f==1:
+    #             self.i+=1
+    #         self.betacounter.append(0)
+
+        
+
+    #     elif self.m<self.phi2 or self.GRADon==0:
+    #         if alpha<1 and abs(G)<0.01 :
+    #             self.beta=self.beta
+    #         else:
+    #             P=np.clip(self.beta-M[-1]*1,0,1)
+    #             self.beta=P.item()
+    #             self.betacounter.append(1)
+
+    #         # if self.Emvg<self.Epvg and self.Emvg< self.Ervg and bep<self.ub and bep>self.lb:   #Swap
+    #         #     self.beta=self.beta
+    #         #     # self.betacounter.append(1)
+    #         #     if self.GRADon==0:
+    #         #         self.betacounter.append(11)
+    #         #     else:
+    #         #         self.betacounter.append(1)
+    #         # elif self.Epvg>self.Ervg:
+    #         #     self.beta=self.beta + self.step # 0.1*self.beta
+    #         #     # self.betacounter.append(2)
+    #         #     if self.GRADon==0:
+    #         #         self.betacounter.append(22)
+    #         #     else:
+    #         #         self.betacounter.append(2)
+    #         # elif self.Epvg<=self.Ervg:
+    #         #     self.beta=self.beta - self.step #0.1*self.beta
+    #         #     # self.betacounter.append(3)
+    #         #     if self.GRADon==0:
+    #         #         self.betacounter.append(33)
+    #         #     else:
+    #         #         self.betacounter.append(3)
+        
+    #     elif self.GRADon==1:
+    #         if P>self.ub:
+    #             self.beta=P.item()*1.1
+    #         elif P<self.lb:
+    #             self.beta=P.item()*.9
+    #         else:
+    #             self.beta=P.item()
+    #         # self.beta=P.item()
+
+    #         # self.beta=self.beta-G *.01  
+    #         self.betacounter.append(4)
+
+    #     # self.beta=self.beta*(1-self.tau)+ self.tau*betanew
+    #     self.m+=1
+    #     self.beta=np.clip(self.beta,0,1)
+        
+    #     return(self.beta)
+        
+    # def reset(self):
+        
+    #     self.beta=self.b0
+    #     self.betacounter=[]
+
+# %% New BEta
+
+
+def expand(x):
+    # [1, x, x^2, x^3, x^4]
+    xx=np.concatenate((np.ones((1,x.size)),
+                        x,
+                        np.multiply(x,x),
+                        # np.multiply(x,np.multiply(x,x)),
+                        # np.multiply(np.multiply(x,x),np.multiply(x,x)),                 
+    ),0)
+    return xx
+def grad(w, x):
+    dx=np.array([[0,
+                    1,
+                    2*x,
+                    # 3*x**2,
+                    # 4*x**3
+                    ]]).T
+        
+    # dx=np.array([[0, 1, 2*x, 3*x**2, 4*x**3 ]]).T
+    G=np.dot(w.T,dx).tolist()[0]
+    return G
+
+def expand_linear(x):
+    # [1, x, x^2, x^3, x^4]
+    xx=np.concatenate((np.ones((1,x.size)),
+                        x,
+                        # np.multiply(x,x)
+                        ),0)
+    
+    # xx=np.concatenate((np.ones((1,x.size)),
+    #                         x),0)
+    return xx
+def grad_L(w, x):
+    dx=np.array([[0,
+                    1,
+                    # 2*x,
+                    # 3*x**2,
+                    # 4*x**3
+                    ]]).T
+        
+    # dx=np.array([[0, 1, 2*x, 3*x**2, 4*x**3 ]]).T
+    G=np.dot(w.T,dx).tolist()[0]
+    return G
+
+
+def regress(x,y):
+    W=np.dot(np.linalg.inv(np.dot(x,x.T)),np.dot(x,y.T))
+    return W
+
+# (1,100)
+
+class beta4:
+    def __init__(self, scls, betastart=0, cap=60, capL=60, phi=60, phi2=60, Timer=60, TimerL=300, ds=1, step=0.02, rlb_tol=0.025, cooldown=1, baseerror=0.02, bounds=[0.3,0.7]):
+        self.clock=[]
+        self.b0=betastart
+        self.lb=bounds[0]
+        self.ub=bounds[1]
+        self.beta=betastart
+        self.m=0
+        self.BE=baseerror
+
+        self.scls=scls      
+        
+        # self.cat=np.array([[0.02, 1, 300]])
+        self.cat=np.array([[0, 0, 1]])
+        self.catL=np.array([[0, 0, 1]])
+
+        self.rlb=[betastart]
+        self.Gcat=[]
+        self.Wcat=[]
+        self.Mcat=[]
+        self.Mwcat=[]
+
+        self.Mpcat=[]
+        self.Mpwcat=[]
+
+        self.Ervg=0
+        self.Epvg=0
+        self.Emvg=0
+        
+        # Buffer capactity
+        self.cap=cap
+        self.capL=capL
+        self.discount=ds
+        self.time=Timer
+        self.timeL=TimerL
+
+        # sufficient learning parameter
+        self.phi=phi
+        self.phi2=phi2
+        
+        # catalog
+        self.betacounter=[]
+        self.lookback=[]
+       
+    #    Cooldown stuff
+        self.f=0
+        self.i=0
+        self.rlb_tolerance=rlb_tol
+        self.step=step
+        self.cooldown=cooldown
+        
+    def beta_update(self, sp, yk, bep):
+        
+        
+        # ynormk1=self.scls.norm(yk)
+        # spnorm1=self.scls.norm(sp)
+        # # ynormk2=self.scls[1].norm(yk[1])
+        # # spnorm2=self.scls[1].norm(sp[1])
+        
+        # enormk=abs(ynormk1-spnorm1)
+        # # enormk=abs(ynormk1-spnorm1)+abs(ynormk2-spnorm2)
+
+        ynormk1=self.scls[0].norm(yk[0])
+        spnorm1=self.scls[0].norm(sp[0])
+        ynormk2=self.scls[1].norm(yk[1])
+        spnorm2=self.scls[1].norm(sp[1])
+        
+        enormk=abs(ynormk1-spnorm1)+abs(ynormk2-spnorm2)
+
+
+        self.cat[:,-1:]=self.cat[:,-1:]-1
+        self.catL[:,-1:]=self.catL[:,-1:]-1
+        self.cat=np.append(self.cat,np.array([[enormk, bep, self.time]]),0)
+        self.catL=np.append(self.catL,np.array([[enormk, bep, self.timeL]]),0)
+
+        subs=[]
+        for i,j in enumerate(self.cat[:,-1]):
+            if j<=0:
+                subs.append(i)
+        for i in reversed(subs):
+            self.cat=np.delete(self.cat,i,0)
+
+        subs=[]
+        for i,j in enumerate(self.catL[:,-1]):
+            if j<=0:
+                subs.append(i)
+        for i in reversed(subs):
+            self.catL=np.delete(self.catL,i,0)
+        
+        if self.cat[self.cat[:,1]<=self.lb][:,1].size>=self.cap:
+            self.cat=np.delete(self.cat,np.where(self.lb>=self.cat[:,1])[0][0],0)
+        if self.cat[self.cat[:,1]>=self.ub][:,1].size>=self.cap:
+            self.cat=np.delete(self.cat,np.where(self.ub<=self.cat[:,1])[0][0],0)
+        if self.cat[(self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub) ][:,1].size>=self.cap:
+            self.cat=np.delete(self.cat,np.where((self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub))[0][0],0)
+
+        if self.catL[self.catL[:,1]<=self.lb][:,1].size>=self.capL:
+            self.catL=np.delete(self.catL,np.where(self.lb>=self.catL[:,1])[0][0],0)
+        if self.catL[self.catL[:,1]>=self.ub][:,1].size>=self.capL:
+            self.catL=np.delete(self.catL,np.where(self.ub<=self.catL[:,1])[0][0],0)
+        if self.catL[(self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub) ][:,1].size>=self.capL:
+            self.catL=np.delete(self.catL,np.where((self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub))[0][0],0)
+        
+        # print(self.catL[self.catL[:,1]>=self.ub])
+
+        # self.cat[:,0:1]=self.cat[:,0:1]*self.discount
+        # self.catL[:,0:1]=self.catL[:,0:1]*self.discount
+        if self.Ervg>self.BE:
+            self.catL[:,0:1]=np.where(self.catL[:,1:2]>=self.ub, self.catL[:,0:1]*self.discount,self.catL[:,0:1])  
+        if self.Epvg>self.BE:
+            self.catL[:,0:1]=np.where(self.catL[:,1:2]<=self.lb, self.catL[:,0:1]*self.discount,self.catL[:,0:1])  
+        if self.Emvg>self.BE:
+            self.catL[:,0:1]=np.where((self.lb<self.catL[:,1:2]) & (self.catL[:,1:2]<self.ub),self.catL[:,0:1]*self.discount,self.catL[:,0:1])
+        
+        self.Ervg=self.catL[self.catL[:,1]>=self.ub][:,0].mean()
+        self.Epvg=self.catL[self.catL[:,1]<=self.lb][:,0].mean()
+        self.Emvg=self.catL[(self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub) ][:,0].mean()
+        if np.isnan(self.Ervg):
+            self.Ervg=self.BE
+            self.catL=np.append(self.catL,np.array([[self.BE, self.ub+(1.0-self.ub)/2, 1]]),0)
+        if np.isnan(self.Epvg):
+            self.Epvg=self.BE
+            self.catL=np.append(self.catL,np.array([[self.BE, 0.0+(self.lb-0.0)/2, 1]]),0)
+        if np.isnan(self.Emvg):
+            self.Emvg=self.BE
+            self.catL=np.append(self.catL,np.array([[self.BE, self.lb+(self.ub-self.lb)/2, 1]]),0)
+       
+        if len(self.cat[self.cat[:,1]>=self.ub][:,0])==0:
+            self.cat=np.append(self.cat,np.array([[self.Ervg, self.ub+(1.0-self.ub)/2, 1]]),0)
+        if len(self.cat[self.cat[:,1]<=self.lb][:,0])==0:    
+            self.cat=np.append(self.cat,np.array([[self.Epvg, 0.0+(self.lb-0.0)/2, 1]]),0)
+        if len(self.cat[(self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub) ][:,0])==0:
+            self.cat=np.append(self.cat,np.array([[self.Emvg, self.lb+(self.ub-self.lb)/2, 1]]),0)
+      
+        xx=expand(self.cat[:,1:2].T)
+        avg=np.array([[ self.Epvg, 0.0+(self.lb-0.0)/2],
+                        [ self.Ervg, self.ub+(1.0-self.ub)/2],
+                        [self.Emvg, self.lb+(self.ub-self.lb)/2]])
+        
+        # avg=np.array([[ self.Epvg, 0.0+(self.lb-0.0)/2],
+        #                 [ self.Ervg, self.ub+(1.0-self.ub)/2]])
+        
+        xxL=expand_linear(avg[:,1:2].T)
+        ML=regress(xxL,avg[:,0:1].T)
+        M=grad_L(ML,bep)[0]
+
+        xxP=expand(self.catL[:,1:2].T)
+        # xxP=expand(avg[:,1:2].T)
+        MP=regress(xxP,self.catL[:,0:1].T)
+        M_p=grad(MP,bep)[0]
+
+        self.Mwcat.append(ML.T.tolist())
+        self.Mcat.append(M)
+
+        self.Mpwcat.append(MP.T.tolist())
+        self.Mpcat.append(M_p)
+
+
+
+        try:
+            W=regress(xx,self.cat[:,0:1].T)
+            G=grad(W,bep)[0]
+            self.Gcat.append(G)
+            self.Wcat.append(W.T.tolist())
+            self.GRADon=0.5
+            self.clock.append(self.m)
+        except:
+            self.GRADon=0
+            print('failedRG')
+            # self.betacounter.append(999)
+        
+        
+        alpha=1
+        if self.GRADon==0.5:
+            
+            if ((M_p>0 and G>0) or (M_p<0 and G<0) or (W[-1]/MP[-1]>0)) or abs(M)<1e-6:              
+                for i in range(10):
+                    P=np.clip(self.beta-G*alpha,0,1)
+                    J=np.dot(W.T,expand(np.array([[P]])))
+                    J2=np.dot(W.T,expand(np.array([[bep]])))
+                    if J2-J>1e-6: #and J>=0:
+                        self.GRADon=1
+                        print('short Grad descent')
+                        break
+                        
+                    elif i==range(10)[-1]:
+                        alpha=1
+                        for s in range(10):
+                            P=np.clip(self.beta-M_p*alpha,0,1)
+                            J=np.dot(MP.T,expand(np.array([[P]])))
+                            J2=np.dot(MP.T,expand(np.array([[bep]])))
+                            if J2-J>1e-6: #and J>=0:
+                                self.GRADon=1
+                                print('long Grad descent')
+                                break
+                            elif s==range(10)[-1]:
+                                self.GRADon=0
+                                print('failedLS')
+                            else:
+                                alpha=alpha*0.5
+        
+                    else:
+                        alpha=alpha*0.5
+            else:
+                self.GRADon=0
+                
+                print('slope disagree')
+    
+        
+
+        # if self.GRADon==0.5:
+        #     xtest=np.array([np.linspace(0,1,100)])
+        #     xxtest=expand(xtest)
+        #     ytest=np.dot(W.T,xxtest)
+        #     P=xtest[:,np.argmin(ytest[-1])].item()
+        #     self.GRADon=1
+
+        self.rlb.append(bep)
+
+
+        self.lookback.append([self.Epvg,self.Emvg,self.Ervg,self.m])
+        self.Ervg=round((self.Ervg),3)
+        self.Epvg=round((self.Epvg),3)
+        self.Emvg=round((self.Emvg),3)
+
+
+
+        if self.f==0 and abs(self.rlb[-1]-self.rlb[-2])>self.rlb_tolerance:
+            self.f=1
+                
+        if self.i>=self.cooldown:
+            self.f=0
+            self.i=0            
+        
+        if self.f==1 or self.m<self.phi:
+            self.beta=self.beta
+            if self.f==1:
+                self.i+=1
+            self.betacounter.append(0)
+
+        
+
+        elif self.m<self.phi2 or self.GRADon==0:
+            if alpha<1 and abs(M_p)<0.01 :
+                self.beta=self.beta
+                print('local min')
+            else:
+                P=np.clip(self.beta-M*1,0,1)
+                self.beta=P.item()
+                self.betacounter.append(1)
+                print('Default M')
+
+            # if self.Emvg<self.Epvg and self.Emvg< self.Ervg and bep<self.ub and bep>self.lb:   #Swap
+            #     self.beta=self.beta
+            #     # self.betacounter.append(1)
+            #     if self.GRADon==0:
+            #         self.betacounter.append(11)
+            #     else:
+            #         self.betacounter.append(1)
+            # elif self.Epvg>self.Ervg:
+            #     self.beta=self.beta + self.step # 0.1*self.beta
+            #     # self.betacounter.append(2)
+            #     if self.GRADon==0:
+            #         self.betacounter.append(22)
+            #     else:
+            #         self.betacounter.append(2)
+            # elif self.Epvg<=self.Ervg:
+            #     self.beta=self.beta - self.step #0.1*self.beta
+            #     # self.betacounter.append(3)
+            #     if self.GRADon==0:
+            #         self.betacounter.append(33)
+            #     else:
+            #         self.betacounter.append(3)
+        
+        elif self.GRADon==1:
+            # if P>self.ub:
+            #     self.beta=P.item()*1.1
+            # elif P<self.lb:
+            #     self.beta=P.item()*.9
+            # else:
+            #     self.beta=P.item()
+
+            # if abs(G)>1e-6:
+            #     self.beta=P.item()
+            #     print('gradient descent')
+            # else:
+            #     self.beta=self.beta
+            #     print('small grad')
+
+            self.beta=P.item()
+            print('gradient descent')
+
+            # self.beta=self.beta-G *.01  
+            self.betacounter.append(4)
+
+        # self.beta=self.beta*(1-self.tau)+ self.tau*betanew
+        self.m+=1
+        self.beta=np.clip(self.beta,0,1)
+        
+        return(self.beta)
+        
+    def reset(self):
+        
+        self.beta=self.b0
+        self.betacounter=[]
+
+
+
+
+
+
+# %% (JUNK)
+# tester=TD3()
+
+# p=([1],[2],[-1],[2])
+# tester.RB.record(p)
+# tester.update()
+# # %%
+# states, actions, rewards, next_states = tester.RB.get_batch()
+# states = torch.FloatTensor([states]).transpose(0,1).float()
+# actions = torch.FloatTensor([actions]).transpose(0,1).float()
+# rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+# next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+
+
+
+# # Critic loss        
+# Qvals1 = tester.critic1.forward(states, actions)
+# Qvals2 = tester.critic2.forward(states, actions)
+# na_= tester.actor_target.forward(next_states).detach()
+# next_actions = np.clip(na_ + np.clip(np.random.normal(0,0.1,na_.size()),-.1,.1) ,-1,1).float()
+
+# # %%
+# next_Q1 = tester.critic_target1.forward(next_states, next_actions)
+# next_Q2 = tester.critic_target2.forward(next_states, next_actions)
+# next_Q=torch.min(next_Q1,next_Q2)
+
+# # %%
+# Qprime = rewards + tester.gamma * next_Q.detach()
+# critic_loss1 = tester.critic_loss1(Qvals1, Qprime)
+# tester.c_L1.append(critic_loss1.detach().numpy())
+# critic_loss2 = tester.critic_loss2(Qvals2, Qprime)
+# tester.c_L2.append(critic_loss2.detach().numpy())
+
+
+
+
+# %% Backup old DDPGE
+# class DDPGagent:
+#     def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
+#         # Params
+#         self.num_states = n_states
+#         self.num_actions = n_actions
+#         self.gamma = gamma
+#         self.tau = tau
+
+#         self.c_L=[]
+#         self.p_L=[]
+
+#         # Networks
+#         self.actor = policy(self.num_states,self.num_actions)
+#         self.actor_target = policy(self.num_states,self.num_actions)
+#         self.critic = Qfun(self.num_states, self.num_actions)
+#         self.critic_target = Qfun(self.num_states, self.num_actions)
+
+#         for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+#             target_param.data.copy_(param.data)
+
+#         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+#             target_param.data.copy_(param.data)
+        
+#         # Training
+#         self.RB = Buffer(self.num_states,self.num_actions,buffer_capacity)        
+#         self.critic_loss  = nn.MSELoss()
+#         self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+#         self.critic_opt= torch.optim.Adam(self.critic.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+    
+#     def get_action(self, state):
+#         state = torch.tensor([state]).float()
+#         action = self.actor.forward(state)
+#         action = np.squeeze(action.detach().numpy())
+#         # action=np.ndarray.item(action)
+#         return action
+    
+#     def update(self):
+#         states, actions, rewards, next_states = self.RB.get_batch()
+#         states = torch.FloatTensor([states]).transpose(0,1).float()
+#         actions = torch.FloatTensor([actions]).transpose(0,1).float()
+#         rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+#         next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+#         # Critic loss        
+#         Qvals = self.critic.forward(states, actions)
+#         next_actions = self.actor_target.forward(next_states)
+#         next_Q = self.critic_target.forward(next_states, next_actions.detach())
+#         Qprime = rewards + self.gamma * next_Q
+#         critic_loss = self.critic_loss(Qvals, Qprime)
+#         self.c_L.append(critic_loss.detach().numpy())
+
+#         # Actor loss
+#         policy_loss = -self.critic.forward(states, self.actor.forward(states)).mean()
+#         self.p_L.append(policy_loss.detach().numpy())
+
+#         # update networks
+    
+        
+
+#         self.actor_opt.zero_grad()
+#         policy_loss.backward()
+#         self.actor_opt.step()
+
+#         self.critic_opt.zero_grad()
+#         critic_loss.backward() 
+#         self.critic_opt.step()
+
+
+#         # update target networks 
+#         for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+#             target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+#         for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+#             target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+# %% Flowsheet Setup
+# Flowsheet Setup
+
+
+
+
+
+
+# time_set=[0,30,60]
+time_set=[0,60]  #OG VERY IMPORTANT
+
+
+# setpoints = ["maximum_H2", "maximum_H2",    #og
+#     "neutral",
+#     "power", "power",
+#     "neutral",
+#     "maximum_H2", "maximum_H2"]
+
+ramp_setpoints = [
+            "maximum_H2", "maximum_H2",
+            "power", "power",
+            "maximum_H2", "maximum_H2",
+        ]
+
+# ramp_setpoints = [
+#             "maximum_H2", "maximum_H2",
+#             "minimum_H2", "minimum_H2",
+#             "maximum_H2", "maximum_H2"]
+
+step_setpoints = ramp_setpoints
+
+
+
+
+m.fs = SoecStandaloneFlowsheet(
+            dynamic=True,
+            time_set=time_set,
+            time_units=pyo.units.s,
+            thin_electrolyte_and_oxygen_electrode=True,
+            has_gas_holdup=False,
+            include_interconnect=True,
+        )
+
+        
+#%% Controllers
+
+# iscale.calculate_scaling_factors(m)  #og
+# solver = pyo.SolverFactory("ipopt")
+
+iscale.calculate_scaling_factors(m)
+solver = pyo.SolverFactory("ipopt")
+for t in m.fs.time:
+    m.fs.condenser_flash.control_volume.properties_in[t].flow_mol_phase["Liq"].domain = pyo.Reals
+    m.fs.condenser_flash.control_volume.properties_in[t].flow_mol_phase["Liq"].bounds = (None, None)
+    m.fs.condenser_flash.control_volume.properties_in[t].phase_frac["Liq"].domain = pyo.Reals
+    m.fs.condenser_flash.control_volume.properties_in[t].phase_frac["Liq"].bounds = (None, None)
+    for var in [
+        m.fs.condenser_flash.control_volume.properties_in[t].log_mole_frac_tdew, 
+        m.fs.condenser_flash.control_volume.properties_in[t]._mole_frac_tdew,
+    ]:
+        for idx in var.index_set():
+            var[idx].domain = pyo.Reals
+            var[idx].bounds = (None, None)
+
+
+
+
+
+# %% Old Controllers
+
+# # antiwindup = ControllerAntiwindupType.BACK_CALCULATION  OG
+# # inner_controller_pairs = ComponentMap()
+
+
+# #########################################################################
+# #Inner Controller
+
+# # inner_controller_pairs[m.fs.feed_heater.electric_heat_duty] = (
+# # "feed_heater_inner_controller",
+# # m.fs.soc_module.fuel_inlet.temperature,
+# # ControllerType.PI,
+# # ControllerMVBoundType.SMOOTH_BOUND,
+# # antiwindup,
+# # )
+# ###########################################################################
+
+
+# inner_controller_pairs[m.fs.sweep_heater.electric_heat_duty] = (
+# "sweep_heater_inner_controller",
+# m.fs.soc_module.oxygen_inlet.temperature,
+# ControllerType.PI,
+# ControllerMVBoundType.SMOOTH_BOUND,
+# antiwindup,
+# )
+
+# m.fs.add_controllers(inner_controller_pairs)
+# variable_pairs = ComponentMap()
+
+
+# #############################################################################
+# # Outer Controller
+
+# # variable_pairs[m.fs.feed_heater_inner_controller.setpoint] = (
+# # "feed_heater_outer_controller",
+# # m.fs.soc_module.fuel_outlet.temperature,
+# # ControllerType.P,
+# # ControllerMVBoundType.NONE,
+# # ControllerAntiwindupType.NONE,
+# # )
+
+# ###########################################################################
+
+# variable_pairs[m.fs.sweep_heater_inner_controller.setpoint] = (
+# "sweep_heater_outer_controller",
+# m.fs.soc_module.oxygen_outlet.temperature,
+# ControllerType.P,
+# ControllerMVBoundType.NONE,
+# ControllerAntiwindupType.NONE,
+# )
+
+# variable_pairs[m.fs.soc_module.potential_cell] = (
+# "voltage_controller",
+# m.fs.soc_module.fuel_outlet_mole_frac_comp_H2,
+# ControllerType.PI,
+# ControllerMVBoundType.SMOOTH_BOUND,
+# antiwindup,
+# )
+     
+# variable_pairs[m.fs.sweep_recycle_split.recycle_ratio] = (
+# "sweep_recycle_controller",
+# m.fs.soc_module.oxygen_outlet.temperature,
+# ControllerType.P,
+# ControllerMVBoundType.SMOOTH_BOUND,
+# ControllerAntiwindupType.NONE,
+# )
+
+# m.fs.add_controllers(variable_pairs)
+
+############################################################################################################
+
+# %% New Controllers
+antiwindup = ControllerAntiwindupType.BACK_CALCULATION
+####################################################Inner Controllers########################################################
+
+inner_controller_pairs = ComponentMap()  #always leave
+
+# inner_controller_pairs[m.fs.feed_heater.electric_heat_duty] = (    
+#     "feed_heater_inner_controller",
+#     m.fs.soc_module.fuel_inlet.temperature,
+#     ControllerType.PI,
+#     ControllerMVBoundType.SMOOTH_BOUND,
+#     antiwindup,
+# )
+# inner_controller_pairs[m.fs.sweep_heater.electric_heat_duty] = (
+#     "sweep_heater_inner_controller",
+#     m.fs.soc_module.oxygen_inlet.temperature,
+#     ControllerType.PI,
+#     ControllerMVBoundType.SMOOTH_BOUND,
+#     antiwindup,
+# )
+# m.fs.add_controllers(inner_controller_pairs)
+
+##################################################Outer Controllers#########################################################
+
+
+variable_pairs = ComponentMap()    #always leave
+
+# variable_pairs[m.fs.feed_heater_inner_controller.setpoint] = (
+#     "feed_heater_outer_controller",
+#     m.fs.soc_module.fuel_outlet.temperature,
+#     ControllerType.P,
+#     ControllerMVBoundType.NONE,
+#     ControllerAntiwindupType.NONE,
+# )
+# variable_pairs[m.fs.sweep_heater_inner_controller.setpoint] = (
+#     "sweep_heater_outer_controller",
+#     m.fs.soc_module.oxygen_outlet.temperature,
+#     ControllerType.P,
+#     ControllerMVBoundType.NONE,
+#     ControllerAntiwindupType.NONE,
+# )
+
+
+############################################################################################################
+
+
+#####################################################Original Configuration###################################
+# This is Dougs config with cell potential to mole frac and mass prodution with make up flow
+
+variable_pairs[m.fs.soc_module.potential_cell] = (
+    "voltage_controller",
+    m.fs.soc_module.fuel_outlet_mole_frac_comp_H2,
+    ControllerType.PI,
+    ControllerMVBoundType.SMOOTH_BOUND,
+    antiwindup,
+)
+
+
+
+
+variable_pairs[m.fs.sweep_blower.inlet.flow_mol] = (
+    "sweep_blower_controller",
+    m.fs.stack_core_temperature,
+    ControllerType.P,
+    ControllerMVBoundType.SMOOTH_BOUND,
+    # antiwindup,
+    ControllerAntiwindupType.NONE,
+)
+
+
+
+variable_pairs[m.fs.makeup_mix.makeup.flow_mol] = (
+    "h2_production_rate_controller",
+    m.fs.h2_mass_production,
+    ControllerType.P,
+    ControllerMVBoundType.SMOOTH_BOUND,
+    ControllerAntiwindupType.NONE,
+    # antiwindup,
+)
+############################################################################################################
+
+
+
+#####################################################Dr B suggest###################################
+# variable_pairs[m.fs.soc_module.potential_cell] = (
+#     "voltage_controller",
+#     m.fs.h2_mass_production,
+#     ControllerType.PI,
+#     ControllerMVBoundType.SMOOTH_BOUND,
+#     antiwindup,
+# )
+
+# variable_pairs[m.fs.sweep_blower.inlet.flow_mol] = (
+#     "sweep_blower_controller",
+#     m.fs.stack_core_temperature,
+#     ControllerType.P,
+#     ControllerMVBoundType.SMOOTH_BOUND,
+#     # antiwindup,
+#     ControllerAntiwindupType.NONE,
+# )
+
+# variable_pairs[m.fs.makeup_mix.makeup.flow_mol] = (
+#     "h2_production_rate_controller",
+#     m.fs.soc_module.fuel_outlet_mole_frac_comp_H2,
+#     ControllerType.P,
+#     ControllerMVBoundType.SMOOTH_BOUND,
+#     ControllerAntiwindupType.NONE,
+#     # antiwindup,
+# )
+############################################################################################################
+
+
+
+# variable_pairs[m.fs.sweep_recycle_split.recycle_ratio] = (
+#     "sweep_recycle_controller",
+#     m.fs.soc_module.oxygen_outlet.temperature,
+#     ControllerType.P,
+#     ControllerMVBoundType.SMOOTH_BOUND,
+#     ControllerAntiwindupType.NONE,
+# )
+# variable_pairs[m.fs.condenser_hx.cold_side_inlet.flow_mol] = (
+#     "condenser_controller",
+#     m.fs.condenser_hx.hot_side_outlet.temperature,
+#     ControllerType.P,
+#     ControllerMVBoundType.SMOOTH_BOUND,
+# )
+m.fs.add_controllers(variable_pairs)
+
+    
+# %% Old Gains
+
+# ################################################################################  OG
+# # K = 10e4
+# # tau_I = 15*60
+# # tau_D = 5*60
+# # m.fs.feed_heater_inner_controller.gain_p.fix(K)
+# # m.fs.feed_heater_inner_controller.gain_i.fix(K/tau_I)
+# # m.fs.feed_heater_inner_controller.mv_lb = 0
+# # m.fs.feed_heater_inner_controller.mv_ub = 10e6
+# # m.fs.feed_heater_inner_controller.smooth_eps = 1000
+# # if antiwindup == ControllerAntiwindupType.BACK_CALCULATION:
+# #             m.fs.feed_heater_inner_controller.gain_b.fix(0.5/tau_I)
+# ################################################################################  
+
+
+# K =20e4
+# tau_I = 15*60
+# tau_D = 5*60
+# m.fs.sweep_heater_inner_controller.gain_p.fix(K)
+# m.fs.sweep_heater_inner_controller.gain_i.fix(K/tau_I)
+# m.fs.sweep_heater_inner_controller.mv_lb = 0
+# m.fs.sweep_heater_inner_controller.mv_ub = 10e6
+# m.fs.sweep_heater_inner_controller.smooth_eps = 1000
+# if antiwindup == ControllerAntiwindupType.BACK_CALCULATION:
+#             m.fs.sweep_heater_inner_controller.gain_b.fix(0.5/tau_I)
+
+
+# ################################################################################  
+# # K = 0.75
+# # tau_I = 60*60
+# # m.fs.feed_heater_outer_controller.gain_p.fix(K)
+# ################################################################################
+
+
+# K = 0.75
+# tau_I = 60*60
+# m.fs.sweep_heater_outer_controller.gain_p.fix(K)
+        
+# K = -2
+# tau_I = 240
+# m.fs.voltage_controller.gain_p.fix(K)
+# m.fs.voltage_controller.gain_i.fix(K/tau_I)
+# m.fs.voltage_controller.mv_lb = 0.7
+# m.fs.voltage_controller.mv_ub = 1.6
+# m.fs.voltage_controller.smooth_eps = 0.01
+# if antiwindup == ControllerAntiwindupType.BACK_CALCULATION:
+#             m.fs.voltage_controller.gain_b.fix(0.5/tau_I)
+
+# K = 0
+# m.fs.sweep_recycle_controller.gain_p.fix(K)
+# m.fs.sweep_recycle_controller.mv_lb = 0.01
+# m.fs.sweep_recycle_controller.mv_ub = 2
+# m.fs.sweep_recycle_controller.smooth_eps = 1e-3
+############################################################################################################
+############################################################################################################
+
+# %% New Gains
+#############################################Inner and Outer Controller###############################################################
+#  # # K = 0
+# K = 10e4
+# tau_I = 15*60
+# tau_D = 5*60
+# m.fs.feed_heater_inner_controller.gain_p.fix(K)
+# m.fs.feed_heater_inner_controller.gain_i.fix(K/tau_I)
+# # m.fs.feed_heater_inner_controller.gain_d.fix(K * tau_D)
+# m.fs.feed_heater_inner_controller.mv_lb = 0
+# m.fs.feed_heater_inner_controller.mv_ub = 10e6
+# m.fs.feed_heater_inner_controller.smooth_eps = 1000
+# if antiwindup == ControllerAntiwindupType.BACK_CALCULATION:
+#     m.fs.feed_heater_inner_controller.gain_b.fix(0.5/tau_I)
+
+# # K = 0
+# K =20e4
+# tau_I = 15*60
+# tau_D = 5*60
+# m.fs.sweep_heater_inner_controller.gain_p.fix(K)
+# m.fs.sweep_heater_inner_controller.gain_i.fix(K/tau_I)
+# # m.fs.sweep_heater_inner_controller.gain_d.fix(K * tau_D)
+# m.fs.sweep_heater_inner_controller.mv_lb = 0
+# m.fs.sweep_heater_inner_controller.mv_ub = 10e6
+# m.fs.sweep_heater_inner_controller.smooth_eps = 1000
+# if antiwindup == ControllerAntiwindupType.BACK_CALCULATION:
+#     m.fs.sweep_heater_inner_controller.gain_b.fix(0.5/tau_I)
+
+# K = 0.75
+# # K = 0
+# tau_I = 60*60
+# m.fs.feed_heater_outer_controller.gain_p.fix(K)
+# # m.fs.feed_heater_outer_controller.gain_i.fix(K/tau_I)
+# # m.fs.feed_heater_outer_controller.mv_lb = 0
+# # m.fs.feed_heater_outer_controller.mv_ub = 4e6
+# # m.fs.feed_heater_outer_controller.smooth_eps = 0.1
+
+# K = 0.75
+# # K = 0
+# tau_I = 60*60
+# m.fs.sweep_heater_outer_controller.gain_p.fix(K)
+# # m.fs.sweep_heater_outer_controller.gain_i.fix(K/tau_I)
+# # m.fs.sweep_heater_outer_controller.mv_lb = 0
+# # m.fs.sweep_heater_outer_controller.mv_ub = 12e6
+# # m.fs.sweep_heater_outer_controller.smooth_eps = 0.01
+
+
+############################################################################################################
+
+
+## K = 0
+K = -2
+tau_I = 240
+m.fs.voltage_controller.gain_p.fix(K)
+m.fs.voltage_controller.gain_i.fix(K/tau_I)
+m.fs.voltage_controller.mv_lb = 0.7
+m.fs.voltage_controller.mv_ub = 1.6
+m.fs.voltage_controller.smooth_eps = 0.01
+if antiwindup == ControllerAntiwindupType.BACK_CALCULATION:
+    m.fs.voltage_controller.gain_b.fix(0.5/tau_I)
+
+K = -50
+tau_I = 40 * 60
+m.fs.sweep_blower_controller.gain_p.fix(K)
+## m.fs.sweep_blower_controller.gain_i.fix(K / tau_I)
+m.fs.sweep_blower_controller.mv_lb = 1500
+m.fs.sweep_blower_controller.mv_ub = 10000
+m.fs.sweep_blower_controller.smooth_eps = 10
+## if antiwindup == ControllerAntiwindupType.BACK_CALCULATION:
+##     m.fs.sweep_blower_controller.gain_b.fix(0.5/tau_I)
+
+## K = 0
+## # K = -0.5 * 0.025
+## # tau_I = 1200
+## m.fs.sweep_recycle_controller.gain_p.fix(K)
+## #m.fs.sweep_recycle_controller.gain_i.fix(K / tau_I)
+## m.fs.sweep_recycle_controller.mv_lb = 0.01
+## m.fs.sweep_recycle_controller.mv_ub = 2
+## m.fs.sweep_recycle_controller.smooth_eps = 1e-3
+
+K = 200
+tau_I = 20 * 60
+m.fs.h2_production_rate_controller.gain_p.fix(K)
+
+# m.fs.h2_production_rate_controller.gain_i.fix(K / tau_I) #############################################changed for servo
+
+m.fs.h2_production_rate_controller.mv_lb = 1
+m.fs.h2_production_rate_controller.mv_ub = 1500
+m.fs.h2_production_rate_controller.smooth_eps = 1
+## if antiwindup == ControllerAntiwindupType.BACK_CALCULATION:
+##     m.fs.h2_production_rate_controller.gain_b.fix(0.5/tau_I)
+
+step_mvs = ComponentSet([])
+## step_mvs.add(m.fs.voltage_controller.mv_ref)
+## step_mvs.add(m.fs.voltage_controller.setpoint)
+step_mvs.add(m.fs.makeup_mix.makeup_mole_frac_comp_H2)
+step_mvs.add(m.fs.makeup_mix.makeup_mole_frac_comp_H2O)
+## step_mvs.add(m.fs.h2_production_rate_controller.mv_ref)
+step_mvs.add(m.fs.h2_production_rate_controller.setpoint)
+step_mvs.add(m.fs.h2_production_rate_controller.gain_p)
+## step_mvs.add(m.fs.h2_production_rate_controller.gain_i)
+
+
+#  %% Old Create Ramp Eqs
+
+# # create_ramping_eqns(m.fs, m.fs.manipulated_variables, 1) # OG
+
+# for ctrl in m.fs.controller_set:
+#             iscale.calculate_scaling_factors(ctrl)
+# for ctrl in m.fs.controller_set:
+#             iscale.calculate_scaling_factors(ctrl)
+
+# time_nfe = len(m.fs.time) - 1
+# # time_nfe = 1
+# pyo.TransformationFactory("dae.finite_difference").apply_to(
+#             m.fs, nfe=time_nfe, wrt=m.fs.time, scheme="BACKWARD"
+#         )
+
+# if operating_scenario == OperatingScenario.minimum_production:
+#             ms.from_json(m, fname="min_production.json.gz", wts=ms.StoreSpec.value())
+# elif operating_scenario == OperatingScenario.maximum_production:
+#             ms.from_json(m, fname="max_production.json.gz", wts=ms.StoreSpec.value())
+# elif operating_scenario == OperatingScenario.power_mode:
+#             ms.from_json(m, fname="power_mode.json.gz", wts=ms.StoreSpec.value())
+# elif operating_scenario == OperatingScenario.neutral:
+#             ms.from_json(m, fname="neutral.json.gz", wts=ms.StoreSpec.value())
+
+# m.fs.feed_heater.electric_heat_duty.unfix()  ######################
+# m.fs.sweep_heater.electric_heat_duty.unfix()
+
+#         # Copy initial conditions to rest of model for initialization
+# m.fs.fix_initial_conditions()
+
+
+# %% New Create Ramps
+ramp_mvs = m.fs.manipulated_variables - step_mvs
+
+# create_ramping_eqns(m.fs, ramp_mvs, 1)
+
+for ctrl in m.fs.controller_set:
+    iscale.calculate_scaling_factors(ctrl)
+for ctrl in m.fs.controller_set:
+    iscale.calculate_scaling_factors(ctrl)
+
+time_nfe = len(m.fs.time) - 1
+pyo.TransformationFactory("dae.finite_difference").apply_to(
+    m.fs, nfe=time_nfe, wrt=m.fs.time, scheme="BACKWARD"
+)
+if operating_scenario == OperatingScenario.minimum_production:
+    ms.from_json(m, fname="min_production.json.gz", wts=ms.StoreSpec.value())
+elif operating_scenario == OperatingScenario.maximum_production:
+    ms.from_json(m, fname="max_production.json.gz", wts=ms.StoreSpec.value())
+elif operating_scenario == OperatingScenario.power_mode:
+    ms.from_json(m, fname="power_mode.json.gz", wts=ms.StoreSpec.value())
+elif operating_scenario == OperatingScenario.neutral:
+    ms.from_json(m, fname="neutral.json.gz", wts=ms.StoreSpec.value())
+
+m.fs.feed_heater.electric_heat_duty.unfix()
+m.fs.sweep_heater.electric_heat_duty.unfix()
+
+# Copy initial conditions to rest of model for initialization
+m.fs.fix_initial_conditions()
+
+
+# %% Old Alias
+
+
+# alias_dict = ComponentMap()
+# alias_dict[m.fs.voltage_controller.mv_ref] = "potential"
+# alias_dict[m.fs.voltage_controller.setpoint] = "soc_fuel_outlet_mole_frac_comp_H2"
+# alias_dict[m.fs.soc_module.fuel_outlet_mole_frac_comp_H2] = "soc_fuel_outlet_mole_frac_comp_H2"
+# alias_dict[m.fs.makeup_mix.makeup.flow_mol] = "makeup_feed_rate"
+# alias_dict[m.fs.sweep_blower.inlet.flow_mol] = "sweep_feed_rate"
+# ####################################################################################
+# alias_dict[m.fs.feed_heater.electric_heat_duty]="feed_heater_duty"
+# ####################################################################################
+# # alias_dict[m.fs.feed_heater_inner_controller.mv_ref] = "feed_heater_duty"
+# # alias_dict[m.fs.feed_heater_outer_controller.mv_ref] = "feed_heater_outlet_temperature"
+# # alias_dict[m.fs.feed_heater_outer_controller.setpoint] = "fuel_outlet_temperature"
+# alias_dict[m.fs.sweep_heater_inner_controller.mv_ref] = "sweep_heater_duty"
+# alias_dict[m.fs.sweep_heater_outer_controller.mv_ref] = "sweep_heater_outlet_temperature"
+# alias_dict[m.fs.sweep_heater_outer_controller.setpoint] = "sweep_outlet_temperature"
+# alias_dict[m.fs.makeup_mix.makeup_mole_frac_comp_H2] = "makeup_mole_frac_comp_H2"
+# alias_dict[m.fs.makeup_mix.makeup_mole_frac_comp_H2O] = "makeup_mole_frac_comp_H2O"
+# alias_dict[m.fs.condenser_flash.vap_outlet.temperature] = "condenser_hot_outlet_temperature"
+# alias_dict[m.fs.sweep_recycle_controller.mv_ref] = "sweep_recycle_ratio"
+# alias_dict[m.fs.sweep_recycle_controller.setpoint] = "sweep_outlet_temperature"
+# alias_dict[m.fs.feed_recycle_split.recycle_ratio] = "fuel_recycle_ratio"
+# alias_dict[m.fs.condenser_split.recycle_ratio] = "vgr_recycle_ratio"
+
+# df = pd.read_csv("soec_flowsheet_operating_conditions.csv", index_col=0)
+# t0 = m.fs.time.first()
+
+        
+# for var in m.fs.manipulated_variables:
+#     shortname = var.name.split(".")[-1]
+#     alias = alias_dict[var]
+#     blk = var.parent_block()
+   
+
+#     var[:].fix(float(df[alias][setpoints[0]]))
+
+   
+
+
+#         # Need to initialize the setpoint for the inner controller or else it starts with the default value 0.5.
+# # m.fs.feed_heater_inner_controller.setpoint[0].value = m.fs.feed_heater_outer_controller.mv_ref[0].value
+# # m.fs.sweep_heater_inner_controller.setpoint[0].value = m.fs.sweep_heater_outer_controller.mv_ref[0].value
+        
+# for ctrl in m.fs.controller_set:
+#             if hasattr(ctrl, "mv_eqn"):
+#                 calculate_variable_from_constraint(ctrl.manipulated_var[0], ctrl.mv_eqn[0])
+
+
+# copy_first_steady_state()
+# iscale.calculate_scaling_factors(m)
+# iscale.scale_time_discretization_equations(m.fs,m.fs.time,time_scaling_factor=1/60)
+
+# %%New Alias
+
+alias_dict = ComponentMap()
+alias_dict[m.fs.voltage_controller.mv_ref] = "potential"
+alias_dict[m.fs.voltage_controller.setpoint] = "soc_fuel_outlet_mole_frac_comp_H2"
+alias_dict[m.fs.soc_module.fuel_outlet_mole_frac_comp_H2] = "soc_fuel_outlet_mole_frac_comp_H2"
+## alias_dict[m.fs.makeup_mix.makeup.flow_mol] = "makeup_feed_rate"
+alias_dict[m.fs.h2_production_rate_controller.mv_ref] = "makeup_feed_rate"
+alias_dict[m.fs.h2_production_rate_controller.setpoint] = "h2_production_rate"
+alias_dict[m.fs.h2_production_rate_controller.gain_p] = "h2_production_rate_controller_gain_p"
+## alias_dict[m.fs.h2_production_rate_controller.gain_i] = "h2_production_rate_controller_gain_i"
+## alias_dict[m.fs.sweep_blower.inlet.flow_mol] = "sweep_feed_rate"
+alias_dict[m.fs.sweep_blower_controller.mv_ref] = "sweep_feed_rate"
+alias_dict[m.fs.sweep_blower_controller.setpoint] = "stack_core_temperature"
+#################################################################################
+alias_dict[m.fs.feed_heater.electric_heat_duty] = "feed_heater_duty"  #swap
+# alias_dict[m.fs.feed_heater_inner_controller.mv_ref] = "feed_heater_duty"  #check
+#################################################################################
+# alias_dict[m.fs.feed_heater_outer_controller.mv_ref] = "feed_heater_outlet_temperature"  #check
+# alias_dict[m.fs.feed_heater_outer_controller.setpoint] = "fuel_outlet_temperature"   #check
+#################################################################################
+alias_dict[m.fs.sweep_heater.electric_heat_duty] = "sweep_heater_duty"   #swap
+# alias_dict[m.fs.sweep_heater_inner_controller.mv_ref] = "sweep_heater_duty" #check
+#################################################################################
+# alias_dict[m.fs.sweep_heater_outer_controller.mv_ref] = "sweep_heater_outlet_temperature"  #check
+# alias_dict[m.fs.sweep_heater_outer_controller.setpoint] = "sweep_outlet_temperature"   #check
+alias_dict[m.fs.makeup_mix.makeup_mole_frac_comp_H2] = "makeup_mole_frac_comp_H2"
+alias_dict[m.fs.makeup_mix.makeup_mole_frac_comp_H2O] = "makeup_mole_frac_comp_H2O"
+## alias_dict[m.fs.condenser_flash.heat_duty] = "condenser_heat_duty"
+alias_dict[m.fs.condenser_flash.vap_outlet.temperature] = "condenser_hot_outlet_temperature"
+
+alias_dict[m.fs.sweep_recycle_split.recycle_ratio] = "sweep_recycle_ratio"
+## alias_dict[m.fs.sweep_recycle_controller.mv_ref] = "sweep_recycle_ratio"
+## alias_dict[m.fs.sweep_recycle_controller.setpoint] = "sweep_outlet_temperature"
+
+alias_dict[m.fs.feed_recycle_split.recycle_ratio] = "fuel_recycle_ratio"
+alias_dict[m.fs.condenser_split.recycle_ratio] = "vgr_recycle_ratio"
+
+# %% alias dict for pyomo pid
+
+# alias_dict = ComponentMap()
+# alias_dict[m.fs.voltage_controller.mv_ref] = "potential"
+# alias_dict[m.fs.voltage_controller.setpoint] = "soc_fuel_outlet_mole_frac_comp_H2"
+# alias_dict[m.fs.soc_module.fuel_outlet_mole_frac_comp_H2] = "soc_fuel_outlet_mole_frac_comp_H2"
+# ## alias_dict[m.fs.makeup_mix.makeup.flow_mol] = "makeup_feed_rate"
+# alias_dict[m.fs.h2_production_rate_controller.mv_ref] = "makeup_feed_rate"
+# alias_dict[m.fs.h2_production_rate_controller.setpoint] = "h2_production_rate"
+# alias_dict[m.fs.h2_production_rate_controller.gain_p] = "h2_production_rate_controller_gain_p"
+# ## alias_dict[m.fs.h2_production_rate_controller.gain_i] = "h2_production_rate_controller_gain_i"
+# ## alias_dict[m.fs.sweep_blower.inlet.flow_mol] = "sweep_feed_rate"
+# alias_dict[m.fs.sweep_blower_controller.mv_ref] = "sweep_feed_rate"
+# alias_dict[m.fs.sweep_blower_controller.setpoint] = "stack_core_temperature"
+# #################################################################################
+# # alias_dict[m.fs.feed_heater.electric_heat_duty] = "feed_heater_duty"  #swap
+# alias_dict[m.fs.feed_heater_inner_controller.mv_ref] = "feed_heater_duty"  #check
+# #################################################################################
+# alias_dict[m.fs.feed_heater_outer_controller.mv_ref] = "feed_heater_outlet_temperature"  #check
+# alias_dict[m.fs.feed_heater_outer_controller.setpoint] = "fuel_outlet_temperature"   #check
+# #################################################################################
+# # alias_dict[m.fs.sweep_heater.electric_heat_duty] = "sweep_heater_duty"   #swap
+# alias_dict[m.fs.sweep_heater_inner_controller.mv_ref] = "sweep_heater_duty" #check
+# #################################################################################
+# alias_dict[m.fs.sweep_heater_outer_controller.mv_ref] = "sweep_heater_outlet_temperature"  #check
+# alias_dict[m.fs.sweep_heater_outer_controller.setpoint] = "sweep_outlet_temperature"   #check
+# alias_dict[m.fs.makeup_mix.makeup_mole_frac_comp_H2] = "makeup_mole_frac_comp_H2"
+# alias_dict[m.fs.makeup_mix.makeup_mole_frac_comp_H2O] = "makeup_mole_frac_comp_H2O"
+# ## alias_dict[m.fs.condenser_flash.heat_duty] = "condenser_heat_duty"
+# alias_dict[m.fs.condenser_flash.vap_outlet.temperature] = "condenser_hot_outlet_temperature"
+
+# alias_dict[m.fs.sweep_recycle_split.recycle_ratio] = "sweep_recycle_ratio"
+# ## alias_dict[m.fs.sweep_recycle_controller.mv_ref] = "sweep_recycle_ratio"
+# ## alias_dict[m.fs.sweep_recycle_controller.setpoint] = "sweep_outlet_temperature"
+
+# alias_dict[m.fs.feed_recycle_split.recycle_ratio] = "fuel_recycle_ratio"
+# alias_dict[m.fs.condenser_split.recycle_ratio] = "vgr_recycle_ratio"
+
+
+# %%  initalize
+
+df = pd.read_csv("soec_flowsheet_operating_conditions.csv", index_col=0)
+t0 = m.fs.time.first()
+for var in ramp_mvs:
+    shortname = var.name.split(".")[-1]
+    alias = alias_dict[var]
+    blk = var.parent_block()
+    
+    var[:].fix(float(df[alias][ramp_setpoints[0]]))
+    
+    # v_ramp = getattr(blk, shortname + "_ramp_rate")
+    # var[t0].fix(float(df[alias][ramp_setpoints[0]]))
+    # for i, t in enumerate(time_set):
+    #     v_ramp[t].fix(float(
+    #         (df[alias][ramp_setpoints[i]] - df[alias][ramp_setpoints[i-1]])
+    #         / (time_set[i] - time_set[i-1])
+    #     ))
+
+for var in step_mvs:
+    shortname = var.name.split(".")[-1]
+    alias = alias_dict[var]
+
+    var[:].fix(float(df[alias][step_setpoints[0]]))
+
+    # for i, t in enumerate(time_set):
+    #     var[t].fix(float(df[alias][step_setpoints[i]]))
+
+# Need to initialize the setpoint for the inner controller or else it starts with the default value 0.5.
+# m.fs.feed_heater_inner_controller.setpoint[0].value = m.fs.feed_heater_outer_controller.mv_ref[0].value  #check
+# m.fs.sweep_heater_inner_controller.setpoint[0].value = m.fs.sweep_heater_outer_controller.mv_ref[0].value  #check
+
+## m.fs.feed_heater_inner_controller.negative_pv[0.0].value = - m.fs.soc_module.fuel_properties_in[0.0].temperature
+## m.fs.sweep_heater_inner_controller.negative_pv[0.0].value = - m.fs.soc_module.oxygen_properties_in[0.0].temperature
+
+for ctrl in m.fs.controller_set:
+    if hasattr(ctrl, "mv_eqn"):
+        calculate_variable_from_constraint(ctrl.manipulated_var[0], ctrl.mv_eqn[0])
+
+        
+
+
+#%% Presolve
+# Presolve
+# # idaeslog.solver_log.tee = True  #OG
+# results = petsc.petsc_dae_by_time_element(
+#             m,
+#             time=m.fs.time,
+#             # timevar=m.fs.timevar,
+#             keepfiles=True,
+#             symbolic_solver_labels=True,
+#             ts_options={
+#                 "--ts_type": "beuler",
+#                 "--ts_dt": 60,
+#                 "--ts_rtol": 1e-3,
+#                 # "--ts_adapt_clip":"0.001,300",
+#                 # "--ksp_monitor":"",
+#                 "--ts_adapt_dt_min": 1e-6,
+#                 # "--ts_adapt_dt_max": 300,
+#                 "--ksp_rtol": 1e-10,
+#                 "--snes_type": "newtontr",
+#                 # "--ts_max_reject": 200,
+#                 # "--snes_monitor":"",
+#                 "--ts_monitor": "",
+#                 "--ts_save_trajectory": 1,
+#                 "--ts_trajectory_type": "visualization",
+#                 "--ts_max_snes_failures": 1000,
+#                 # "--show_cl":"",
+#             },
+#             skip_initial=False,
+#             initial_solver="ipopt",
+#             # vars_stub="soec_flowsheet_prototype",
+#             # trajectory_save_prefix="soec_flowsheet_prototype",
+#         )
+#         # assert False
+# # traj = results.trajectory
+
+# r=reset_m()
+# r.save(m)
+
+
+results = petsc.petsc_dae_by_time_element(
+    m,
+    time=m.fs.time,
+    # timevar=m.fs.timevar,
+    keepfiles=True,
+    symbolic_solver_labels=True,
+    ts_options={
+        "--ts_type": "beuler",
+        "--ts_dt": 10,
+        "--ts_rtol": 1e-3,
+        # "--ts_adapt_clip":"0.001,300",
+        # "--ksp_monitor":"",
+        "--ts_adapt_dt_min": 1e-6,
+        # "--ts_adapt_dt_max": 300,
+        "--ksp_rtol": 1e-10,
+        "--snes_type": "newtontr",
+        # "--ts_max_reject": 200,
+        # "--snes_monitor":"",
+        "--ts_monitor": "",
+        "--ts_save_trajectory": 1,
+        "--ts_trajectory_type": "visualization",
+        "--ts_max_snes_failures": 1000,
+        # "--show_cl":"",
+    },
+    skip_initial=False,
+    initial_solver="ipopt",
+    # vars_stub="soec_flowsheet_prototype",
+    # trajectory_save_prefix="soec_flowsheet_prototype",
+)
+# assert False
+# traj = results.trajectory
+# save_results(m, np.array(m.fs.time)[1:], results.trajectory, "PI_ramping")
+
+r=reset_m()
+r.save(m)
+
+# %% Scaling Issues
+
+# jac, nlp = iscale.get_jacobian(m)
+# import numpy as np
+# from scipy.linalg import svd
+# import pyomo.environ as pyo
+# import idaes.core.util.scaling as iscale
+# variables = nlp.get_pyomo_variables()
+# constraints = nlp.get_pyomo_equality_constraints()
+# print("Badly scaled variables:")
+# for i in iscale.extreme_jacobian_columns(
+#         jac=jac, nlp=nlp, large=1E3, small=5E-3):
+#     print(f"    {i[0]:.2e}, [{i[1]}]")
+# print("\n\n" + "Badly scaled constraints:")
+# for i in iscale.extreme_jacobian_rows(
+#         jac=jac, nlp=nlp, large=1E3, small=5E-3):
+#     print(f"    {i[0]:.2e}, [{i[1]}]")
+# # print(f"Jacobian Condition Number: {iscale.jacobian_cond(jac=jac):.2e}")
+# # if not hasattr(m.fs, "obj"):
+# #     m.fs.obj = pyo.Objective(expr=0)
+# n_sv = 10
+# u, s, vT = svd(jac.todense(), full_matrices=False)
+
+# print("\n" + f"Spectral condition number: {s[0]/s[-1]:.3e}")
+# # Reorder singular values and vectors so that the singular
+# # values are from least to greatest
+# u = np.flip(u[:, -n_sv:], axis=1)
+# s = np.flip(s[-n_sv:], axis=0)
+# vT = np.flip(vT[-n_sv:, :], axis=0)
+# v = vT.transpose()
+# print("\n" + f"Smallest singular value: {s[0]}")
+# print("\n" + "Variables in smallest singular vector:")
+# for i in np.where(abs(v[:, 0]) > 0.1)[0]:
+#     print(str(i) + ": " + variables[i].name)
+# print("\n" + "Constraints in smallest singular vector:")
+# for i in np.where(abs(u[:, 0]) > 0.1)[0]:
+#     print(str(i) + ": " + constraints[i].name)
+
+# %% Start
+n_states=12
+
+# n_states=14
+# n_states=27
+n_actions=2
+# DDPG=DDPGagent(n_states,n_actions)
+# wd=1e-3
+wd=0
+bs=128
+# (self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, w_decay=0, p=2):
+Agent=TD3(n_states,n_actions, 1e-4, 1e-3, 0.99, 1e-3, 100000, bs, wd)
+#1e-3
+# Agent=DDPGagent(n_states,n_actions, 1e-4, 1e-3, 0.99, 1e-3, 100000, bs, wd)
+
+# t.append([m.fs.soc_module.potential_cell[m.fs.time.last()].value,
+#          1       m.fs.feed_heater.electric_heat_duty[m.fs.time.last()].value,
+#           2      m.fs.sweep_heater.electric_heat_duty[m.fs.time.last()].value,
+#           3      m.fs.soc_module.fuel_inlet.temperature[m.fs.time.last()].value,
+#           4      m.fs.soc_module.oxygen_inlet.temperature[m.fs.time.last()].value,
+#           5      m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value,
+#           6      m.fs.soc_module.oxygen_outlet.temperature[m.fs.time.last()].value,
+#           7      m.fs.soc_module.fuel_outlet_mole_frac_comp_H2[m.fs.time.last()].value,
+#           8      m.fs.sweep_blower.inlet.flow_mol[m.fs.time.last()].value,
+#           9      m.fs.stack_core_temperature[m.fs.time.last()].value,
+#           10      m.fs.makeup_mix.makeup.flow_mol[m.fs.time.last()].value,
+#           11      m.fs.h2_mass_production[m.fs.time.last()].value,
+#           12      e1,
+#           13      e2
+#                 ])
+
+
+# %% Saved NN DDPG
+
+
+# # negative. RL tradition. Noise=0.08. Ep=200
+# path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models\actor')
+# path_at=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models\actor_target')
+# path_c=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models\critic')
+# path_ct=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models\critic_target')
+
+# negative RL trad 0.25 noise ep=8*220 reset on (both loops)  PETSC plus some beta training
+# path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models2\actor')
+# path_at=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models2\actor_target')
+# path_c=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models2\critic')
+# path_ct=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models2\critic_target')
+
+# RL trad training set point changes reset on 0.25 noise 100 episodes
+# path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models3\actor')
+# path_at=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models3\actor_target')
+# path_c=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models3\critic')
+# path_ct=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models3\critic_target')
+
+# Beta trial. sp change.
+# path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models4\actor')
+# path_at=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models4\actor_target')
+# path_c=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models4\critic')
+# path_ct=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models4\critic_target')
+
+# error squared new run Ep=100 temp set point change. Newest. 14 states 2 actions noise=0.25
+# path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models5\actor')
+# path_at=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models5\actor_target')
+# path_c=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models5\critic')
+# path_ct=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models5\critic_target')
+
+# error squared new run Ep=50 temp set point change. Newest. 14 states 2 actions noise=0.25
+# path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models6\actor')
+# path_at=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models6\actor_target')
+# path_c=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models6\critic')
+# path_ct=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models6\critic_target')
+
+# error squared new run Ep=40 temp set point change. Newest. 14 states 2 actions noise=0.35
+# path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models7\actor')
+# path_at=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models7\actor_target')
+# path_c=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models7\critic')
+# path_ct=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models7\critic_target')
+
+
+# %% Saved NN TD3
+
+
+
+
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\linmod1\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\linmod1\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\linmod1\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\linmod1\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\linmod1\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\linmod1\critic_target2')
+
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\linmod2\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\linmod2\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\linmod2\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\linmod2\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\linmod2\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\linmod2\critic_target2')
+
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\linmod3\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\linmod3\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\linmod3\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\linmod3\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\linmod3\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\linmod3\critic_target2')
+
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\linmod4\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\linmod4\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\linmod4\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\linmod4\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\linmod4\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\linmod4\critic_target2')
+
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\linmod5\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\linmod5\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\linmod5\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\linmod5\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\linmod5\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\linmod5\critic_target2')
+
+# 10000 episode; .15 noise; 0.2 R reset
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\linmod6\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\linmod6\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\linmod6\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\linmod6\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\linmod6\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\linmod6\critic_target2')
+
+# 10000 episode; .15 noise; 0.1 R reset (best for linear model)
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\linmod7\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\linmod7\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\linmod7\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\linmod7\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\linmod7\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\linmod7\critic_target2')
+
+# 10000 episode; .15 noise; 0.1 R reset wd=1e-5  (best linmod sp far)
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\linmod8\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\linmod8\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\linmod8\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\linmod8\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\linmod8\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\linmod8\critic_target2')
+
+# 1000 episode; .15 noise; 0.1 R reset wd=0  
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\model1\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\model1\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\model1\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\model1\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\model1\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\model1\critic_target2')
+
+# 1000 episode; .15 noise; 0.1 R reset wd=0  
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\model2\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\model2\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\model2\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\model2\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\model2\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\model2\critic_target2')
+
+# 2000 episodes; 0.15 noise; 0.1 R reset; wd = 0   NORMAL CHOICE FOR RL
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\model3\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\model3\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\model3\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\model3\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\model3\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\model3\critic_target2')
+
+# 2000 episodes; 0.15 noise; 0.1 R reset; wd = 0
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\model4\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\model4\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\model4\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\model4\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\model4\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\model4\critic_target2')
+
+# 1000 episodes; 0.15 noise; 0 R reset; wd = 0
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\model5nr\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\model5nr\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\model5nr\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\model5nr\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\model5nr\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\model5nr\critic_target2')
+
+# 1000 episodes; 0.15 noise; 0.1 R reset; wd = 0; RL-PID
+# path_a=(r'G:\My Drive\Python Scripts\modelEXC\rlpid1\actor')
+# path_at=(r'G:\My Drive\Python Scripts\modelEXC\rlpid1\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\modelEXC\rlpid1\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\rlpid1\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\modelEXC\rlpid1\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\rlpid1\critic_target2')
+
+# 1000 episodes; newest beta function; 0.15 noise; no reset; RL-PID; B.BE=0.015 121223
+path_a=(r'G:\My Drive\Python Scripts\modelEXC\rlpid2\actor')
+path_at=(r'G:\My Drive\Python Scripts\modelEXC\rlpid2\actor_target')
+path_c1=(r'G:\My Drive\Python Scripts\modelEXC\rlpid2\critic1')
+path_ct1=(r'G:\My Drive\Python Scripts\modelEXC\rlpid2\critic_target1')
+path_c2=(r'G:\My Drive\Python Scripts\modelEXC\rlpid2\critic2')
+path_ct2=(r'G:\My Drive\Python Scripts\modelEXC\rlpid2\critic_target2')
+
+
+# %% Save model commands
+# torch.save(Agent.actor,path_a)
+# torch.save(Agent.actor_target,path_at)
+# torch.save(Agent.critic1,path_c1)
+# torch.save(Agent.critic_target1,path_ct1)
+# torch.save(Agent.critic2,path_c2)
+# torch.save(Agent.critic_target2,path_ct2)
+
+
+# Agent.actor= torch.load(path_a)
+# Agent.actor_target= torch.load(path_at)
+# Agent.critic= torch.load(path_c)
+# Agent.critic_target= torch.load(path_ct)
+
+
+Agent.actor= torch.load(path_a)
+Agent.actor_target= torch.load(path_at)
+Agent.critic1= torch.load(path_c1)
+Agent.critic_target1= torch.load(path_ct1)
+Agent.critic2= torch.load(path_c2)
+Agent.critic_target2= torch.load(path_ct2)
+
+# for name, param in Agent.actor.named_parameters(P):
+#     if param.requires_grad:
+#         print( name, param.data)
+
+# path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models\actor')
+# Agent.actor= torch.load(path_a)
+# for name, param in Agent.actor.named_parameters():
+#     if param.requires_grad:
+#         print( name, param.data)
+
+
+# %% Special train
+sp_train=False
+if sp_train:
+    bfile='Buff100ep015n.pkl'
+    with open(bfile, "rb") as pkl_rb_obj:
+        data = pickle.load(pkl_rb_obj)
+
+    # for i in data[0]:
+    #     i.pop(-1)
+    #     i.pop(-1)
+
+    #     i.pop(-1)
+    #     i.pop(-1)
+    #     i.pop(-1)
+    #     i.pop(-1)
+    #     i.pop(-1)
+        
+    #     i.pop(1)
+    #     i.pop(1)
+
+    #     i.pop(0)
+    #     # i.pop(0)
+    #     # i.pop(0)
+        
+    # for i in data[-1]:
+    #     i.pop(-1)
+    #     i.pop(-1)
+
+    #     i.pop(-1)
+    #     i.pop(-1)
+    #     i.pop(-1)
+    #     i.pop(-1)
+    #     i.pop(-1)
+        
+    #     i.pop(1)
+    #     i.pop(1)
+
+    #     i.pop(0)
+    #     # i.pop(0)
+    #     # i.pop(0)
+
+    DDPG.RB.state_buffer=data[0]
+    DDPG.RB.action_buffer=data[1]
+    DDPG.RB.reward_buffer=data[2]
+    # DDPG.RB.reward_buffer=[[i[0]*100] for i in data[2]]
+    DDPG.RB.next_state_buffer=data[3]
+    DDPG.RB.buffer_counter=len(data[0])
+
+
+    prac_epmax=5000
+    tstart=time.time()
+    for ep in range(prac_epmax):
+        print('--------------')
+        print(ep/prac_epmax)
+        print('--------------')
+
+        DDPG.update()
+
+    tend=time.time()
+    print(tend-tstart)
+
+    closs=DDPG.c_L
+    ploss=DDPG.p_L
+
+
+    plt.figure()
+    plt.plot(closs)
+    plt.title('closs')
+    plt.figure()
+    plt.plot(ploss)
+    plt.title('ploss')
+
+    DDPG.c_L=[]
+    DDPG.p_L=[]
+# %%
+# for name, param in DDPG.critic.named_parameters():
+#     if param.requires_grad:
+#         print( name, param.data)
+# %%   setpoints
+feed_duty=[]
+feed_heater_outlet_temp=[]
+fuel_outlet_temp=[]
+sweep_duty=[]
+sweep_heater_outlet_temp=[]
+sweep_outlet_temp=[]
+
+for i,t in enumerate(ramp_setpoints):
+    feed_duty.append(df['feed_heater_duty'][ramp_setpoints[i]])
+    feed_heater_outlet_temp.append(df['feed_heater_outlet_temperature'][ramp_setpoints[i]])
+    fuel_outlet_temp.append(df['fuel_outlet_temperature'][ramp_setpoints[i]])
+    sweep_duty.append(df['sweep_heater_duty'][ramp_setpoints[i]])
+    sweep_heater_outlet_temp.append(df['sweep_heater_outlet_temperature'][ramp_setpoints[i]])
+    sweep_outlet_temp.append(df['sweep_outlet_temperature'][ramp_setpoints[i]])
+
+
+
+dev_sp=[df['potential'][ramp_setpoints[0]], 
+        df['feed_heater_duty'][ramp_setpoints[0]],
+        df['sweep_heater_duty'][ramp_setpoints[0]],
+        df['feed_heater_outlet_temperature'][ramp_setpoints[0]],
+        df['sweep_heater_outlet_temperature'][ramp_setpoints[0]],
+        df['fuel_outlet_temperature'][ramp_setpoints[0]],
+        df['sweep_outlet_temperature'][ramp_setpoints[0]],
+        df['soc_fuel_outlet_mole_frac_comp_H2'][ramp_setpoints[0]],
+        df['sweep_feed_rate'][ramp_setpoints[0]],
+        df['stack_core_temperature'][ramp_setpoints[0]],
+        df['makeup_feed_rate'][ramp_setpoints[0]],
+        df['h2_production_rate'][ramp_setpoints[0]],       
+        ]
+
+# cat.append([m.fs.soc_module.potential_cell[m.fs.time.last()].value,
+#                 m.fs.feed_heater.electric_heat_duty[m.fs.time.last()].value,
+#                 m.fs.sweep_heater.electric_heat_duty[m.fs.time.last()].value,
+#                 m.fs.soc_module.fuel_inlet.temperature[m.fs.time.last()].value,
+#                 m.fs.soc_module.oxygen_inlet.temperature[m.fs.time.last()].value,
+#                 m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value,
+#                 m.fs.soc_module.oxygen_outlet.temperature[m.fs.time.last()].value,
+#                 m.fs.soc_module.fuel_outlet_mole_frac_comp_H2[m.fs.time.last()].value,
+#                 m.fs.sweep_blower.inlet.flow_mol[m.fs.time.last()].value,
+#                 m.fs.stack_core_temperature[m.fs.time.last()].value,
+#                 m.fs.makeup_mix.makeup.flow_mol[m.fs.time.last()].value,
+#                 m.fs.h2_mass_production[m.fs.time.last()].value,
+#                 e1,
+#                 e2
+#                 ])
+
+# %%  loop fun
+# Loop
+import logging
+logging.getLogger('pyomo.repn.plugins.nl_writer').setLevel(logging.ERROR)
+
+# dt_set = [t_start, t_ramp, t_ramp, t_settle, t_ramp, t_ramp, t_end]
+# time_set_ramp = [sum(dt_set[:j])/60 for j in range(len(dt_set)+1)]
+
+
+def sigmoid(first,second,eps):
+    out=np.exp((first-second)/eps)/(1+np.exp((first-second)/eps))
+    if math.isnan(out):
+        out=1
+    return out
+
+# def ret():
+#      error=scsp.norm(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value) - scsp.norm(o_sp)
+#      duty_diff=sc.norm(abs(m.fs.sweep_heater.electric_heat_duty[m.fs.time.last()].value-finala))
+#      abs_error=-abs(error)*(duty_diff+1)
+#      return abs_error
+
+def ret():
+    error1=sc_out[0].norm(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value)-sc_out[0].norm(o_sp_f)
+    error2=sc_out[1].norm(m.fs.soc_module.oxygen_outlet.temperature[m.fs.time.last()].value)-sc_out[1].norm(o_sp_s)
+    
+    # error1=scls[3].norm(m.fs.soc_module.fuel_inlet.temperature[m.fs.time.last()].value)-scls[3].norm(i_sp_f)
+    # error2=scls[4].norm(m.fs.soc_module.oxygen_inlet.temperature[m.fs.time.last()].value)-scls[4].norm(i_sp_s)
+    
+    #  error=scsp.norm(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value) - scsp.norm(o_sp)
+    dist=np.sqrt(error1**2 + error2**2)
+    bound=sigmoid(radius,dist,1e-3)
+    # -((1-bound)+bound*(dist/0.1))
+
+    abs_error=-abs(error1)+-abs(error2)
+    # abs_error=-(error1**2 + error2**2)*100
+    
+    # abs_error=-((10*error1)**2 + (10*error2)**2)
+    # abs_error=-((100*error1)**2 + (100*error2)**2)
+    
+    # abs_error=-(error1**2 + error2**2) + -((1-bound)+bound*(dist/radius))
+    return abs_error, error1, error2, dist
+
+def decide(bep,pida,rla):
+    actual=bep*rla+(1-bep)*pida
+    return actual
+
+# %% Scaling
+
+# feed outer controller setpoint
+ubsp_f=984*1.1
+lbsp_f=923*.9
+# sweep outer controller setpoint
+ubsp_s=1012*1.1
+lbsp_s=940*.9
+
+# inner controller feed setpoint
+# ub_o=984*1.1
+# lb_o=923*.9  #inner sp
+ub_o_f=10e6
+lb_o_f=0  #inner sp
+
+#inner controller sweep setpoint
+# ub_o_s=970*1.1
+# lb_o_s=920*0.9  #inner sp 
+ub_o_s=10e6
+lb_o_s=0  #inner sp
+
+#inner controller feed mv
+ub_i_f=10e6
+# lb_i=100000*.9
+lb_i_f=0
+
+#inner controller sweep mv
+ub_i_s=10e6
+# lb_i_s=100000*0.9
+lb_i_s=0
+
+
+# scsp=scale_fun_sig(lbsp_f,ubsp_f)
+# sc=scale_fun_sig(lb_i_f,ub_i_f)
+
+
+
+# feed_inner_PID=PID(10e4,1,1,lb_i_f,ub_i_f)
+# feed_outer_PID=PID(0.75,60*60*10e8,1,lb_o_f,ub_o_f)
+# sweep_inner_PID=PID(20e4,1,1,lb_i_s,ub_i_s)
+# sweep_outer_PID=PID(0.75,60*60*10e8,1,lb_o_s,ub_o_s)
+
+
+du_lb=[-1e7*0.1, -1e7*0.1]
+du_ub=[1e7*0.1, 1e7*0.1]
+
+
+lbs=np.array([0.5, 0,   0,   800,  800,  950,  950, 0.5, 1000, 900, 500, -2])
+ubs=np.array([1.5, 1e7, 1e7, 1000, 1000, 1050, 1050, 1, 10000, 1050, 1500, 2])
+# lbs=np.array([950,  950])   #smaller scale
+# ubs=np.array([1050, 1050])  #smaller sclae
+scls=create_scales_sig(lbs,ubs)
+
+
+# lba=np.array([-1e6,   -1e6])   
+# uba=np.array([1e6, 1e6])
+# scla=create_scales_tanh(lba,uba)  #Delta A
+
+lba=np.array([0,   0])
+uba=np.array([1e7, 1e7])
+scla=create_scales_sig(lba,uba)  #Absolute A
+
+
+
+
+sc_out=[scls[5],scls[6]]
+
+dev_Nsp=[scls[j].norm(k) for j,k in enumerate(dev_sp)]
+
+# %%  Settings
+
+
+# #H2 changes #################################
+
+# epmax=5
+epmax=1
+
+# B.phi=0
+terminate_val=-0.1
+on_noise=0     # add nosie
+on_reset=0   #reset every episode
+conditional_reset=0 #reset out of bounds
+on_bep=1   #changing bep
+bepref=0   #RL=1  PID=0
+save_nn=0   #save updating NN
+save_data=0 #save all data after running
+mode_sw= 0  #mode switch
+sp_sw=0     #servo switch H2
+specific_sp=1  #servo switch H2 specifc
+Tsp_sw=0  #servo switch outlet T
+specific_T_sp=0
+limit_du=0  #limit rate of change
+petsc_on=0
+var_solve=0
+# time_final=30   #Short timer
+time_final=5   #Short timer
+
+
+# #Mode Switching settings
+# epmax=1
+# # B.phi=0
+# terminate_val=-0.1
+# on_noise=0     # add nosie
+# on_reset=0   #reset every episode
+# conditional_reset=0 #reset out of bounds
+# on_bep=1   #changing bep
+# bepref=0   #RL=1  PID=0
+# save_nn=0   #save updating NN
+# save_data=0 #save all data after running
+# mode_sw= 1  #mode switch
+# sp_sw=0     #servo switch H2
+# specific_sp=0  #servo switch H2 specifc
+# Tsp_sw=0  #servo switch outlet T
+# specific_T_sp=0
+# limit_du=0  #limit rate of change
+# petsc_on=0
+# var_solve=1
+# # time_final=100   S#hort TImerr
+
+# %%
+
+
+# epmax=1000
+# # B.phi=0
+# terminate_val=-0.1
+
+# on_noise=1     # add nosie
+# on_reset=0   #reset every episode
+# conditional_reset=0 #reset out of bounds
+
+# on_bep=1   #changing bep
+# bepref=0   #RL=1  PID=0
+
+# save_nn=0   #save updating NN
+# save_data=0 #save all data after running
+
+# mode_sw= 0  #mode switch
+# sp_sw=1     #servo switch H2
+# specific_sp=0  #servo switch H2 specifc
+
+# Tsp_sw=0  #servo switch outlet T
+# specific_T_sp=0
+
+# limit_du=0  #limit rate of change
+
+# petsc_on=0
+# var_solve=0
+
+
+# time_final=100
+
+
+# cap=60
+# phi=0
+# cap=120
+# phi=120
+# B=beta(cap,phi,sc_out,ds=0.99,rlb_tol=0.025, cooldown=1)  #cooldown=10
+# B=beta(cap,phi,sc_out,ds=0.96,rlb_tol=0.025, cooldown=5)  #cooldown=10
+# def __init__(self, scls, betastart=0, cap=60, phi=60, phi2=60, Timer=60, ds=1, rlb_tol=0.025, cooldown=1, bounds=[0.3,0.7]):
+# B=beta2(sc_out, betastart=0, cap=20, phi=0, phi2=0, Timer=60*4, ds=1, step=0.25, rlb_tol=0.333, cooldown=1, baseerror=0.02, bounds=[0.3,0.7])
+# B=beta3(sc_out, betastart=0, cap=200, phi=0, phi2=0, Timer=30, ds=1, step=0.2, rlb_tol=0.333, cooldown=1, baseerror=0.5, bounds=[0.3,0.7])
+
+# B=beta3(sc_out, betastart=0, cap=3, capL=10, phi=0, phi2=20, Timer=1e3, TimerL=1e3, ds=1, step=0.2, rlb_tol=0.333, cooldown=1, baseerror=0.02, bounds=[0.3,0.7])
+
+# B=beta3(sc_out, betastart=0, cap=3, capL=10, phi=0, phi2=0, Timer=1e3, TimerL=1e3, ds=0.999, step=0.2, rlb_tol=0.333, cooldown=1, baseerror=0.02, bounds=[0.3,0.7])
+
+# B=beta3(sc_out, betastart=0, cap=3, capL=10, phi=0, phi2=20, Timer=1e3, TimerL=1e3, ds=0.999, step=0.2, rlb_tol=0.333, cooldown=1, baseerror=0.02, bounds=[0.3,0.7])  SAVED Oneds
+# B=beta2(sc_out, betastart=0, cap=10, phi=0, phi2=29, Timer=300, ds=1, step=0.25, rlb_tol=0.333, cooldown=1, baseerror=0.02, bounds=[0.3,0.7]) #Best so far  slope formul;a
+
+B=beta4(sc_out, betastart=0, cap=10, capL=60, phi=0, phi2=0, Timer=10, TimerL=1e3,
+         ds=0.999, step=0.2, rlb_tol=0.333, cooldown=1, baseerror=.015, bounds=[0.3,0.7])
+
+
+
+
+# sp_new=1.5
+radius=0.05
+# %%  Starter stuff
+# t_start = 1 * 60 * 60
+# t_ramp = 10 * 60
+# t_settle = 5 * 60 * 60
+# t_end = 2 * 60 * 60
+
+# t_start =  60 * (10)
+# t_ramp =   60 * (10)
+# t_settle = 60 * (60*3)  
+# t_end =    60 * (60*3)
+
+sp_new_set=[2, 1, 1.5, 0.4, 2]   #actual
+# sp_new_set=[2, 1]
+# sp_new_set=[2, 1, 1.5, 0.4, 2, 2, 1, 1.5, 0.4, 2] 
+
+Tsp_set=[(0,0),(0,5),(-5,0),(-2.5,2.5),(0,0)]
+
+# Tsp_set=[(0,0),(0,5),(-5,0),(-2.5,2.5),(-2.5,-2.5),(0,0)] #Garbagew
+# Tsp_set=[(5,0),(0,-5),(2.5,-2.5),(-2.5,-2.5),(0,0)]  #Garbagew
+
+# t_start =  60 * (10)
+# t_ramp =   60 * (10)
+# t_settle = 60 * (60*1)  
+# t_end =    60 * (60*1)
+
+# t_start =  60 * (20)
+# t_ramp =   60 * (10)
+# t_settle = 60 * (60*2)  
+# t_end =    60 * (60*2)
+
+t_start =  60 * (20)
+t_ramp =   60 * (10)
+t_settle = 60 * (60*4)  
+t_end =    60 * (60*3)
+
+if sp_sw==1 or Tsp_sw==1 or specific_sp==1:
+    t_start=60*(2)
+
+
+dt_set = [t_start, t_ramp, t_settle, t_ramp, t_end]
+time_set_tick = [sum(dt_set[:j]) for j in range(len(dt_set)+1)]
+
+########################################################################################
+
+if mode_sw==1:
+    time_final=round(time_set_tick[-1]/60)
+    # time_final=30
+
+elif sp_sw==1 or specific_sp==1 or Tsp_sw==1:
+    time_final=60
+    # time_final=30
+
+########################################################################################
+
+# time_final=100
+# time_final=30
+
+# if long_on==1:
+#      time_final=540
+# elif long_on==0:
+#     #  time_final=180
+#      time_final=5
+
+
+OUA_f=OUActionNoise(np.array(0),sigma_max=0.15, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmax*time_final)
+OUA_s=OUActionNoise(np.array(0),sigma_max=0.15, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmax*time_final)
+# OUA_f=OUActionNoise(np.array(0),sigma_max=0.08, sigma_min=0.08, theta=0.15, dt=1, decay_period=epmax*time_final)
+# OUA_s=OUActionNoise(np.array(0),sigma_max=0.08, sigma_min=0.08, theta=0.15, dt=1, decay_period=epmax*time_final)
+# OUA_f=OUActionNoise(np.array(0),sigma_max=0.03, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmax*time_final)
+# OUA_s=OUActionNoise(np.array(0),sigma_max=0.03, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmax*time_final)
+
+
+sp2=ramp_setpoints[1:]
+
+inner_mv_f=feed_duty[1:]
+outer_sp_f=fuel_outlet_temp[1:]
+outer_mv_f=feed_heater_outlet_temp[1:]
+i_mv_f=inner_mv_f[0]
+i_sp_f=outer_mv_f[0]
+o_sp_f=outer_sp_f[0]
+
+inner_mv_s=sweep_duty[1:]
+outer_sp_s=sweep_outlet_temp[1:]
+outer_mv_s=sweep_heater_outlet_temp[1:]
+i_mv_s=inner_mv_s[0]
+i_sp_s=outer_mv_s[0]
+o_sp_s=outer_sp_s[0]
+
+
+# feed_inner_PID=PID(20e4,15*60*.5,1,lb_i_f,ub_i_f,i_mv_f)
+# feed_outer_PID=PID(1,60*60*10e8,1,lb_o_f,ub_o_f,i_sp_f)
+# sweep_inner_PID=PID(40e4,15*60+.5,1,lb_i_s,ub_i_s,i_mv_s)
+# sweep_outer_PID=PID(1,60*60*10e8,1,lb_o_s,ub_o_s,i_sp_s)
+
+# Actual PID tuning
+feed_inner_PID=PID(10e4,15*60,1,lb_i_f,ub_i_f,i_mv_f)
+feed_outer_PID=PID(0.75,60*60*10e8,1,lb_o_f,ub_o_f,i_sp_f)
+sweep_inner_PID=PID(20e4,15*60,1,lb_i_s,ub_i_s,i_mv_s)
+sweep_outer_PID=PID(0.75,60*60*10e8,1,lb_o_s,ub_o_s,i_sp_s)
+
+tt=0
+cat=[]
+catsp=[]
+action=[]
+
+noise_cat=[]
+
+rcatep=[]
+rcatlong=[]
+r30cat=[]
+rew30=[]
+
+bcatlong=[]
+bcatep=[]
+
+rla=[]
+pla=[]
+
+Error_Log=[]
+PoorR_Log=[]
+
+ecatlong=[]
+
+ss=0
+finala=0
+rmp=0
+j=0
+trmp=15
+
+e1=0
+e2=0
+
+reset=0
+
+finala1=None
+finala2=None
+
+startT=time.time()
+sp_new=sp_new_set[0]
+lts=time.time()
+# %%   Loop
+for ep in range(epmax):
+    LDT=(time.time()-lts)/60
+    print('LOOP TIME:',LDT,'--------------------------------')
+    lts=time.time()
+
+    if on_reset==1:
+        feed_inner_PID.reset()
+        feed_outer_PID.reset()
+        sweep_inner_PID.reset()
+        sweep_outer_PID.reset()
+        r.load(m)
+        B.reset()
+    
+    reward=[]
+    bcat=[]
+    bep=B.beta
+
+    # if len(PoorR_Log)>round(epmax/2):
+    #     break
+    
+
+    if sp_sw==1 and epmax>1:
+        sp_new=np.random.uniform(0.4,2)
+
+        dev_Nsp[11]=scls[11].norm(sp_new)
+    elif specific_sp==1 and epmax>1:
+        sp_new=sp_new_set[ep]
+
+        dev_Nsp[11]=scls[11].norm(sp_new)
+    elif Tsp_sw==1 and specific_T_sp==1:
+            o_sp_f=outer_sp_f[rmp-1]+Tsp_set[ep][0]
+            o_sp_s=outer_sp_s[rmp-1]+Tsp_set[ep][1]
+
+            dev_Nsp[5]=scls[5].norm(o_sp_f)
+            dev_Nsp[6]=scls[6].norm(o_sp_s)            
+    elif Tsp_sw==1 and specific_T_sp!=1:
+            # o_sp_f=outer_sp_f[rmp-1]+np.random.uniform(-20,20)
+            o_sp_s=outer_sp_s[rmp-1]+np.random.uniform(-20,20)
+            # o_sp_s=o_sp_f+np.random.uniform(0,5)
+
+            dev_Nsp[5]=scls[5].norm(o_sp_f)
+            dev_Nsp[6]=scls[6].norm(o_sp_s)
+
+    for i in range(time_final):
+        print(' ------------------- ')
+        print(i/time_final)
+        print('Episode:',ep/epmax)
+        print(' ------------------- ')
+
+        ts1=time.time()
+
+        # if on_bep==1:
+        # elif on_bep==0 and bepref==1:
+
+        if on_bep==0 and bepref==1:
+             bep=1
+        elif on_bep==0 and bepref==0:
+             bep=1e-6
+
+
+        if var_solve==1 and mode_sw==1:
+            if (i>time_set_tick[1]/60-1 and i<time_set_tick[2]/60+5) or (i>time_set_tick[3]/60-1 and i<time_set_tick[4]/60+5):  #60 for 5
+                petsc_on=1
+            else:
+                petsc_on=0
+        elif var_solve==1 and (sp_sw==1 or specific_sp==1):
+            if i<5:
+            # if i>time_set_tick[1]/60-1 and i<time_set_tick[1]/60-1+3:
+                petsc_on=1
+            else:
+                petsc_on=0
+        elif var_solve==1 and Tsp_sw==1:
+            if i<5:
+            # if i<time_set_tick[1]/60+1:
+                petsc_on=1
+            else:
+                petsc_on=0
+
+
+        if petsc_on==0:
+            try:
+                solver.solve(m,tee=False)
+            except:
+                try:
+                    results = petsc.petsc_dae_by_time_element(
+                            m,
+                            time=m.fs.time,
+                            # timevar=m.fs.timevar,
+                            keepfiles=True,
+                            symbolic_solver_labels=True,
+                            ts_options={
+                                "--ts_type": "beuler",
+                                "--ts_dt": 10,
+                                "--ts_rtol": 1e-3,
+                                "--ts_adapt_dt_min": 1e-6,
+                                "--ksp_rtol": 1e-10,
+                                "--snes_type": "newtontr",
+                                "--ts_monitor": "",
+                                "--ts_save_trajectory": 1,
+                                "--ts_trajectory_type": "visualization",
+                                "--ts_max_snes_failures": 1000,
+                            },
+                            skip_initial=False,
+                            initial_solver="ipopt",
+                        )
+                except:
+                    try:
+                        solver.solve(m,tee=False)
+                    except:
+                        try:
+                            results = petsc.petsc_dae_by_time_element(
+                                    m,
+                                    time=m.fs.time,
+                                    # timevar=m.fs.timevar,
+                                    keepfiles=True,
+                                    symbolic_solver_labels=True,
+                                    ts_options={
+                                        "--ts_type": "beuler",
+                                        "--ts_dt": 10,
+                                        "--ts_rtol": 1e-3,
+                                        "--ts_adapt_dt_min": 1e-6,
+                                        "--ksp_rtol": 1e-10,
+                                        "--snes_type": "newtontr",
+                                        "--ts_monitor": "",
+                                        "--ts_save_trajectory": 1,
+                                        "--ts_trajectory_type": "visualization",
+                                        "--ts_max_snes_failures": 1000,
+                                    },
+                                    skip_initial=False,
+                                    initial_solver="ipopt",
+                                )
+                        except:
+                            feed_inner_PID.reset()
+                            feed_outer_PID.reset()
+                            sweep_inner_PID.reset()
+                            sweep_outer_PID.reset()
+                            r.load(m)
+                            B.reset()
+                            print('terminated BAD Solve')
+                            reset+=1        
+                            Error_Log.append((ep,i))
+                            break 
+                
+        elif petsc_on==1:
+            try:
+                results = petsc.petsc_dae_by_time_element(
+                        m,
+                        time=m.fs.time,
+                        # timevar=m.fs.timevar,
+                        keepfiles=True,
+                        symbolic_solver_labels=True,
+                        ts_options={
+                            "--ts_type": "beuler",
+                            "--ts_dt": 10,
+                            "--ts_rtol": 1e-3,
+                            "--ts_adapt_dt_min": 1e-6,
+                            "--ksp_rtol": 1e-10,
+                            "--snes_type": "newtontr",
+                            "--ts_monitor": "",
+                            "--ts_save_trajectory": 1,
+                            "--ts_trajectory_type": "visualization",
+                            "--ts_max_snes_failures": 1000,
+                        },
+                        skip_initial=False,
+                        initial_solver="ipopt",
+                    )
+            except:
+                # feed_inner_PID.reset()
+                # feed_outer_PID.reset()
+                # sweep_inner_PID.reset()
+                # sweep_outer_PID.reset()
+                # r.load(m)
+                # B.reset()
+                # print('terminated BAD Solve')
+                # Error_Log.append((ep,i))
+                # break 
+                try:
+                    solver.solve(m,tee=False)
+                except:
+                    try:
+                        results = petsc.petsc_dae_by_time_element(
+                                m,
+                                time=m.fs.time,
+                                # timevar=m.fs.timevar,
+                                keepfiles=True,
+                                symbolic_solver_labels=True,
+                                ts_options={
+                                    "--ts_type": "beuler",
+                                    "--ts_dt": 10,
+                                    "--ts_rtol": 1e-3,
+                                    "--ts_adapt_dt_min": 1e-6,
+                                    "--ksp_rtol": 1e-10,
+                                    "--snes_type": "newtontr",
+                                    "--ts_monitor": "",
+                                    "--ts_save_trajectory": 1,
+                                    "--ts_trajectory_type": "visualization",
+                                    "--ts_max_snes_failures": 1000,
+                                },
+                                skip_initial=False,
+                                initial_solver="ipopt",
+                            )
+                    except:
+                        feed_inner_PID.reset()
+                        feed_outer_PID.reset()
+                        sweep_inner_PID.reset()
+                        sweep_outer_PID.reset()
+                        r.load(m)
+                        B.reset()
+                        print('terminated BAD Solve')
+                        reset+=1        
+                        Error_Log.append((ep,i))
+                        break 
+
+        EE,e1,e2,dist=ret()
+        
+        # ts2=time.time()
+        # print('solver',ts2-ts1)
+        # ecatlong.append(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value - o_sp)
+
+        
+        reward.append(EE)
+        rcatlong.append(EE)
+
+        cat.append([m.fs.soc_module.potential_cell[m.fs.time.last()].value,
+                m.fs.feed_heater.electric_heat_duty[m.fs.time.last()].value,
+                m.fs.sweep_heater.electric_heat_duty[m.fs.time.last()].value,
+                m.fs.soc_module.fuel_inlet.temperature[m.fs.time.last()].value,
+                m.fs.soc_module.oxygen_inlet.temperature[m.fs.time.last()].value,
+                m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value,
+                m.fs.soc_module.oxygen_outlet.temperature[m.fs.time.last()].value,
+                m.fs.soc_module.fuel_outlet_mole_frac_comp_H2[m.fs.time.last()].value,
+                m.fs.sweep_blower.inlet.flow_mol[m.fs.time.last()].value,
+                m.fs.stack_core_temperature[m.fs.time.last()].value,
+                m.fs.makeup_mix.makeup.flow_mol[m.fs.time.last()].value,
+                m.fs.h2_mass_production[m.fs.time.last()].value,                
+                ])
+        
+        # lbs=np.array([0.5, 0,   0,   800,  800,  900,  900, 0.5, 1000, 900, 500, -2])
+        # ubs=np.array([1.5, 1e7, 1e7, 1000, 1000, 1050, 1050, 1, 10000, 1050, 1500, 2 ])
+
+        catsp.append([m.fs.voltage_controller.mv_ref[m.fs.time.last()].value,
+                    # m.fs.feed_heater_inner_controller.mv_ref[m.fs.time.last()].value,
+                    i_mv_f,
+                    # m.fs.sweep_heater_inner_controller.mv_ref[m.fs.time.last()].value,
+                    i_mv_s,
+                    # m.fs.feed_heater_inner_controller.setpoint[m.fs.time.last()].value,
+                    i_sp_f,
+                    # m.fs.sweep_heater_inner_controller.setpoint[m.fs.time.last()].value,
+                    i_sp_s,
+                    # m.fs.feed_heater_outer_controller.setpoint[m.fs.time.last()].value,
+                    o_sp_f,
+                    # m.fs.sweep_heater_outer_controller.setpoint[m.fs.time.last()].value,            
+                    o_sp_s,
+                    m.fs.voltage_controller.setpoint[m.fs.time.last()].value,
+                    m.fs.sweep_blower_controller.mv_ref[m.fs.time.last()].value,
+                    m.fs.sweep_blower_controller.setpoint[m.fs.time.last()].value,
+                    m.fs.h2_production_rate_controller.mv_ref[m.fs.time.last()].value,
+                    m.fs.h2_production_rate_controller.setpoint[m.fs.time.last()].value
+                   
+                   ])
+
+
+
+        if tt>0 and on_bep==1 and i>0:
+            B.beta_update([o_sp_f,o_sp_s],cat[tt][5:7],bcatlong[tt-1])
+            bep=B.beta
+
+       
+
+
+
+        rew30.append(EE)
+        if ss%30==0 and ss!=0:   #30 reeward counter
+             r30cat.append(np.mean(rew30))
+             rew30=[]
+        ss+=1   
+
+        if mode_sw==1:   #Set rmp and trmp
+            for count,z in enumerate(time_set_tick):
+                if i==z/60:
+                    rmp=count
+                    trmp=(time_set_tick[count+1]-time_set_tick[count])/60  ###################################################
+                    j=0
+
+        if sp_sw==1 or specific_sp==1:   #Change set point
+            if i==time_set_tick[1]/60:
+                m.fs.h2_production_rate_controller.setpoint[:].fix(sp_new)
+
+        if tt>0:
+            s_n=[scls[i].norm(k)-dev_Nsp[i] for i,k in enumerate(cat[tt-1])]#[3:7]
+            a_n=[scla[i].norm(k) for i,k in enumerate(action[tt-1])]
+        r_n=[EE]
+        ss_n=[scls[i].norm(k)-dev_Nsp[i] for i,k in enumerate(cat[tt])]#[3:7]
+
+        if tt>0:    #record p for DDPG
+            # p=(jjj[tt-1], [action[tt-1]], [EE], jjj[tt] )
+            p=(s_n, a_n, r_n, ss_n )
+
+            Agent.RB.record(p)
+            Agent.update()
+    
+        
+        if conditional_reset==1:
+            if EE<terminate_val:
+            # if cat[-1][5]>ubs[5] or cat[-1][6]>ubs[6] or cat[-1][5]<lbs[5] or cat[-1][6]< lbs[6]:
+                # tt+=1
+                feed_inner_PID.reset()
+                feed_outer_PID.reset()
+                sweep_inner_PID.reset()
+                sweep_outer_PID.reset()
+                r.load(m)
+                B.reset()
+                print('terminated Big Error')
+                PoorR_Log.append((ep,i))
+                reset+=1                                
+                tt+=2
+                
+                cat.append([m.fs.soc_module.potential_cell[m.fs.time.last()].value,
+                        m.fs.feed_heater.electric_heat_duty[m.fs.time.last()].value,
+                        m.fs.sweep_heater.electric_heat_duty[m.fs.time.last()].value,
+                        m.fs.soc_module.fuel_inlet.temperature[m.fs.time.last()].value,
+                        m.fs.soc_module.oxygen_inlet.temperature[m.fs.time.last()].value,
+                        m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value,
+                        m.fs.soc_module.oxygen_outlet.temperature[m.fs.time.last()].value,
+                        m.fs.soc_module.fuel_outlet_mole_frac_comp_H2[m.fs.time.last()].value,
+                        m.fs.sweep_blower.inlet.flow_mol[m.fs.time.last()].value,
+                        m.fs.stack_core_temperature[m.fs.time.last()].value,
+                        m.fs.makeup_mix.makeup.flow_mol[m.fs.time.last()].value,
+                        m.fs.h2_mass_production[m.fs.time.last()].value,                
+                        ])                
+                catsp.append([m.fs.voltage_controller.mv_ref[m.fs.time.last()].value,
+                            # m.fs.feed_heater_inner_controller.mv_ref[m.fs.time.last()].value,
+                            i_mv_f,
+                            # m.fs.sweep_heater_inner_controller.mv_ref[m.fs.time.last()].value,
+                            i_mv_s,
+                            # m.fs.feed_heater_inner_controller.setpoint[m.fs.time.last()].value,
+                            i_sp_f,
+                            # m.fs.sweep_heater_inner_controller.setpoint[m.fs.time.last()].value,
+                            i_sp_s,
+                            # m.fs.feed_heater_outer_controller.setpoint[m.fs.time.last()].value,
+                            o_sp_f,
+                            # m.fs.sweep_heater_outer_controller.setpoint[m.fs.time.last()].value,            
+                            o_sp_s,
+                            m.fs.voltage_controller.setpoint[m.fs.time.last()].value,
+                            m.fs.sweep_blower_controller.mv_ref[m.fs.time.last()].value,
+                            m.fs.sweep_blower_controller.setpoint[m.fs.time.last()].value,
+                            m.fs.h2_production_rate_controller.mv_ref[m.fs.time.last()].value,
+                            m.fs.h2_production_rate_controller.setpoint[m.fs.time.last()].value                        
+                        ])
+                action.append([m.fs.feed_heater.electric_heat_duty[m.fs.time.last()].value,m.fs.sweep_heater.electric_heat_duty[m.fs.time.last()].value])
+                action.append(action[-1])
+                # rla.append(action[-1])
+                # pla.append(action[-1])
+                # rla.append(action[-1])
+                # pla.append(action[-1])
+
+                
+                break
+
+
+        copy_final_steady_state()
+
+        # ts3=time.time()
+        # print('update',ts3-ts2)
+
+    # ['maximum_H2',
+    #  'neutral',
+    #  'power',
+    #  'power',
+    #  'neutral',
+    #  'maximum_H2',
+    #  'maximum_H2']
+
+        # if i==40:
+        #     m.fs.feed_heater_outer_controller.gain_p.fix(0)
+            
+        if mode_sw==1:  
+            for var in ramp_mvs:
+                    shortname = var.name.split(".")[-1]
+                    alias = alias_dict[var]
+                    blk = var.parent_block()
+                    nwsp=df[alias][sp2[rmp-1]]+ j*60*(df[alias][sp2[rmp]]-df[alias][sp2[rmp-1]])/(trmp*60)
+
+                    var[:].fix(float(nwsp))
+            for var in step_mvs:
+                    shortname = var.name.split(".")[-1]
+                    alias = alias_dict[var]
+
+                    # nwsp2=df[alias][sp2[rmp-1]]+ j*60*(df[alias][sp2[rmp]]-df[alias][sp2[rmp-1]])/(trmp*60)
+                    # var[:].fix(float(nwsp2))
+
+                    var[:].fix(float(df[alias][sp2[rmp]]))
+
+        # if Tsp_sw==1:
+            # o_sp_f=outer_sp_f[rmp-1]+np.random.uniform(-10,10)
+            # o_sp_s=outer_sp_s[rmp-1]+np.random.uniform(-10,10)
+        # else:
+        if Tsp_sw!=1:
+            o_sp_f=outer_sp_f[rmp-1]+j*60*(outer_sp_f[rmp]-outer_sp_f[rmp-1])/(trmp*60)    
+            o_sp_s=outer_sp_s[rmp-1]+j*60*(outer_sp_s[rmp]-outer_sp_s[rmp-1])/(trmp*60)
+        
+        i_mv_f=inner_mv_f[rmp-1]+j*60*(inner_mv_f[rmp]-inner_mv_f[rmp-1])/(trmp*60)
+        i_sp_ref_f=outer_mv_f[rmp-1]+j*60*(outer_mv_f[rmp]-outer_mv_f[rmp-1])/(trmp*60)
+        
+        i_sp_f=feed_outer_PID.awref_action(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value,o_sp_f,i_sp_ref_f,catsp[-1][3])[0]
+        duty_feed,duty_feed_dA=feed_inner_PID.awref_action(m.fs.soc_module.fuel_inlet.temperature[m.fs.time.last()].value,i_sp_f,i_mv_f,finala1)
+        # i_sp_f=feed_outer_PID.ref_action(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value,o_sp_f,i_sp_ref_f)[0]
+        # duty_feed=feed_inner_PID.ref_action(m.fs.soc_module.fuel_inlet.temperature[m.fs.time.last()].value,i_sp_f,i_mv_f)[0]
+
+
+        
+        i_mv_s=inner_mv_s[rmp-1]+j*60*(inner_mv_s[rmp]-inner_mv_s[rmp-1])/(trmp*60)
+        i_sp_ref_s=outer_mv_s[rmp-1]+j*60*(outer_mv_s[rmp]-outer_mv_s[rmp-1])/(trmp*60)
+        
+        i_sp_s=sweep_outer_PID.awref_action(m.fs.soc_module.oxygen_outlet.temperature[m.fs.time.last()].value,o_sp_s,i_sp_ref_s,catsp[-1][4])[0]
+        duty_sweep,duty_sweep_dA=sweep_inner_PID.awref_action(m.fs.soc_module.oxygen_inlet.temperature[m.fs.time.last()].value,i_sp_s,i_mv_s,finala2)
+        # i_sp_s=sweep_outer_PID.ref_action(m.fs.soc_module.oxygen_outlet.temperature[m.fs.time.last()].value,o_sp_s,i_sp_ref_s)[0]
+        # duty_sweep=sweep_inner_PID.ref_action(m.fs.soc_module.oxygen_inlet.temperature[m.fs.time.last()].value,i_sp_s,i_mv_s)[0]
+
+    
+        anorm=Agent.get_action(ss_n)
+
+        
+
+        if ep==epmax or on_noise==0:
+             noisen_f=0
+             noisen_s=0
+        else:
+            noisen_f=OUA_f(ep*time_final+i)
+            noisen_s=OUA_s(ep*time_final+i)
+
+        noise_cat.append([noisen_f,noisen_s])
+
+        act_act_f=scla[0].act(anorm[0])  #e1
+        act_act_s=scla[1].act(anorm[1])   #e2
+
+        rla.append([act_act_f, act_act_s])
+        # pla.append([duty_feed_dA, duty_sweep_dA])  #DeltaA
+        pla.append([duty_feed, duty_sweep])  #absolute A
+        
+
+        
+        # finala1_=decide(bep,duty_feed_dA,act_act_f)     #DeltaA
+        # finala2_=decide(bep,duty_sweep_dA,act_act_s)
+
+        finala1_=decide(bep,duty_feed,act_act_f)   #absolute A
+        finala2_=decide(bep,duty_sweep,act_act_s)
+
+
+        # if tt==0:
+        #     du_lim1=np.clip(finala1_-cat[-1][1], du_lb[0], du_ub[0])
+        #     du_lim2=np.clip(finala2_-cat[-1][2], du_lb[1], du_ub[1])
+        # else:
+        #     du_lim1=np.clip(finala1_-action[-1][0], du_lb[0], du_ub[0])
+        #     du_lim2=np.clip(finala2_-action[-1][1], du_lb[1], du_ub[1])
+
+        # if limit_du==1 and tt==0:
+        #     finala1=cat[-1][1]+du_lim1
+        #     finala2=cat[-1][2]+du_lim2
+        # elif limit_du==1 and tt>0:
+        #     finala1=action[-1][0]+du_lim1
+        #     finala2=action[-1][1]+du_lim2
+        # elif limit_du==0:
+
+
+        # finala1=np.clip(finala1_+cat[-1][1]+(scls[1].act(noisen_f)),lb_i_f,ub_i_f)     #Delta A
+        # finala2=np.clip(finala2_+cat[-1][2]+(scls[2].act(noisen_s)),lb_i_s,ub_i_s)
+
+        finala1=np.clip(finala1_+(scls[1].act(noisen_f)),lb_i_f,ub_i_f)   #absolute A
+        finala2=np.clip(finala2_+(scls[2].act(noisen_s)),lb_i_s,ub_i_s)
+
+
+        # finala1=np.clip(finala1_*e1+cat[-1][1]+(scls[1].act(noisen_f)),lb_i_f,ub_i_f)   #integrator?
+        # finala2=np.clip(finala2_*e2+cat[-1][2]+(scls[2].act(noisen_s)),lb_i_s,ub_i_s)
+
+
+        # if tt%5==0:
+        m.fs.feed_heater.electric_heat_duty.fix(float(finala1)) ######Important
+        m.fs.sweep_heater.electric_heat_duty.fix(float(finala2))
+
+        
+
+        
+        
+        # action.append([finala1-cat[-1][1],finala2-cat[-1][2]])    #Delta A
+
+        action.append([finala1,finala2])   #absolute A
+
+
+
+        bcat.append(bep)
+        bcatlong.append(bep)
+
+        j+=1
+        tt+=1
+
+        ts4=time.time()
+        # print('last third',ts4-ts3)
+        print('total',ts4-ts1)
+    rcatep.append(np.mean(reward))
+    bcatep.append(np.mean(bcat))
+
+    if save_nn==1:
+        # torch.save(Agent.actor,path_a)
+        # torch.save(Agent.actor_target,path_at)
+        # torch.save(Agent.critic,path_c)
+        # torch.save(Agent.critic_target,path_ct)
+        print('f')
+        
+
+        # torch.save(Agent.actor,path_a)
+        # torch.save(Agent.actor_target,path_at)
+        # torch.save(Agent.critic1,path_c1)
+        # torch.save(Agent.critic_target1,path_ct1)
+        # torch.save(Agent.critic2,path_c2)
+        # torch.save(Agent.critic_target2,path_ct2)
+    
+    
+    # if np.mean(reward)<5:
+    #      reset=0
+        
+        
+# %% time elapsed
+           
+
+endT=time.time()
+FinalTime=(endT-startT)/60
+print(FinalTime, 'min')
+print(FinalTime/60, 'hr')
+# %% Sort
+# Sort   
+
+
+catt=np.array(cat).T.tolist()
+cattsp=np.array(catsp).T.tolist()
+tt=range(tt)
+# %%  plots continuous
+# PLot
+
+if mode_sw==1:
+    ramp_lines=True
+elif sp_sw==1 or specific_sp==1 or Tsp_sw==1:
+    ramp_lines=False
+ylim=False
+
+plt.figure()
+plt.plot(tt,catt[0])
+plt.plot(tt,cattsp[0],linestyle=':',color='C0')
+plt.title('Cell Potential')
+plt.ylabel('Cell Potential (V)')
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+if ylim:
+    plt.ylim([.6,1.5])
+plt.xlabel('Time (min)')
+
+plt.figure()
+plt.plot(tt,catt[1],color='C0', label='Feed')
+plt.plot(tt,cattsp[1],linestyle=':',color='C0',label='Feed Target')
+plt.plot(tt,catt[2],color='C1',label='Sweep')
+plt.plot(tt,cattsp[2],linestyle=':',color='C1',label='Sweep Target')
+plt.title('Inner Controller Heat Duty')
+plt.ylabel('Heat Duty (W)')
+plt.legend()
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+# plt.ylim([0,11e6])
+plt.xlabel('Time (min)')
+
+plt.figure()
+plt.plot(tt,catt[3],color='C0',label='Feed')
+plt.plot(tt,cattsp[3],linestyle=':',color='C0',label='Feed Target')
+plt.plot(tt,catt[4],color='C1',label='Sweep')
+plt.plot(tt,cattsp[4],linestyle=':',color='C1',label='Sweep Target')
+plt.plot(tt,catt[9],color='C4',label='Stack')
+plt.plot(tt,cattsp[9],linestyle=':',color='C4',label='Stack Target')
+plt.title('SOC Inlet Temperature')
+plt.ylabel('Temperature (C)')
+plt.legend()
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+if ylim:
+    plt.ylim([850,1150])
+plt.xlabel('Time (min)')
+
+plt.figure()
+plt.plot(tt,catt[5],color='C0',label='Feed')
+plt.plot(tt,cattsp[5],linestyle=':',color='C0',label='Feed Target')
+plt.plot(tt,catt[6],color='C1',label='Sweep')
+plt.plot(tt,cattsp[6],linestyle=':',color='C1',label='Sweep Target')
+plt.title('SOC Outlet Temperature')
+plt.ylabel('Temperature (C)')
+plt.legend()
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+if ylim:   
+    plt.ylim([900,1100])
+plt.xlabel('Time (min)')
+
+        
+plt.figure()
+plt.plot(tt,catt[7])
+plt.plot(tt,cattsp[7],linestyle=':',color='C0')
+plt.title('fuel_outlet_mole_frac_comp_H2')
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+
+plt.figure()
+plt.plot(tt,catt[8])
+plt.plot(tt,cattsp[8],linestyle=':',color='C0')
+plt.title('sweep_blower.inlet.flow_mol')
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+
+# plt.figure()
+# plt.plot(tt,catt[9])
+# plt.plot(tt,cattsp[9],linestyle=':',color='C3')
+# plt.title('stack_core_temperature')
+plt.figure()
+plt.plot(tt,catt[10])
+plt.plot(tt,cattsp[10],linestyle=':',color='C0')
+plt.title('makeup_mix.makeup.flow_mol')
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+
+plt.figure()
+plt.plot(tt,catt[11])
+plt.plot(tt,cattsp[11],linestyle=':',color='C0')
+plt.title('h2_mass_production')
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+
+
+
+
+plt.figure()
+plt.plot(tt,np.array(rla).T[0], label="RL",color="C0")
+plt.plot(tt,np.array(pla).T[0], label="PID",linestyle="--",color="k")
+plt.title('Feed da')
+plt.legend()
+plt.grid(True)
+# plt.ylim([-1e6,1e6])
+
+plt.figure()
+plt.plot(tt,np.array(rla).T[1], label="RL",color="C1")
+plt.plot(tt,np.array(pla).T[1], label="PID",linestyle="--",color="k")
+plt.title('Sweep da')
+plt.grid(True)
+plt.legend()
+# plt.ylim([-1e6,1e6])
+
+# %%   rewartd fun
+closs1=Agent.c_L1
+closs2=Agent.c_L2
+ploss=Agent.p_L
+
+ccc=[]
+mds=25
+for i in range(len(rcatep)):
+    if i<mds:
+        ccc.append(np.median(rcatep[0:i]))
+    else:
+        ccc.append(np.median(rcatep[i-mds:i]))
+
+plt.figure()
+plt.plot(rcatep)
+plt.plot(ccc)
+plt.title('Learning Rate')
+plt.ylabel(r'$\bar{G}$')
+plt.xlabel('epoch')
+plt.axhline(y=-0.08,linestyle='--',color='k',label='PID')
+plt.grid(True)
+plt.legend()
+
+plt.figure()
+plt.plot(bcatep)
+plt.title('Average Beta')
+plt.ylabel(r'$\bar{\beta}$')
+plt.xlabel('epoch')
+# plt.axhline(y=-0.0628,linestyle='--',color='k',label='PID')
+plt.grid(True)
+plt.legend()
+
+plt.figure()
+plt.plot(r30cat)
+plt.title('reward 30 avg')
+
+plt.figure()
+plt.plot(rcatlong)
+plt.title('reward long')
+
+plt.figure()
+plt.plot(bcat)
+plt.title('beta')
+
+plt.figure()
+plt.plot(bcatlong)
+plt.title('betalong')
+
+
+plt.figure()
+plt.plot(closs1)
+plt.title('closs1')
+plt.figure()
+plt.plot(closs2)
+plt.title('closs2')
+plt.figure()
+plt.plot(ploss)
+plt.title('ploss')
+
+# %% norma ctions
+
+N1=np.array(noise_cat).T
+A1=np.array(action).T
+
+plt.figure()
+plt.plot(N1[0])
+plt.plot(N1[1])
+plt.title("noise")
+
+# plt.figure()
+# plt.plot(A1[0])
+# plt.plot(A1[1])
+
+# norma=[]
+norma1=[scla[0].norm(i) for i in A1[0]]
+norma2=[scla[1].norm(i) for i in A1[1]]
+plt.figure()
+plt.plot(norma1,label="feed")
+plt.plot(norma2,label="sweep")
+plt.legend()
+plt.title("normal actual action")
+
+plt.figure()
+plt.plot(rla)
+
+
+# plt.figure()
+
+# plt.plot(np.array(pla).T[0],label="PID feed",color="C1")
+# # plt.plot(A1[0],label="actual feed", color="k")
+# plt.plot(np.array(rla).T[0],label="RL feed",color="C0")
+# plt.legend()
+# plt.title("feed comparison (No resets)")
+# plt.grid(True)
+
+# plt.figure()
+
+# plt.plot(np.array(pla).T[1],label="PID sweep",color="C1")
+# # plt.plot(A1[1],label="actual feed", color="k")
+# plt.plot(np.array(rla).T[1],label="RL sweep",color="C0")
+# plt.legend()
+# plt.title("sweep comparison (No resets)")
+# plt.grid(True)
+# %%  Actual action  (Out) cuz DA
+# plt.figure()
+# plt.plot(tt,catt[1]+np.array(rla).T[0],label="RL")
+# plt.plot(tt,catt[1]+np.array(pla).T[0],label="PID")
+# plt.plot(tt,catt[1],label="actual",color="k")
+# plt.title("feed duty")
+# plt.legend()
+# plt.grid(True)
+
+# plt.figure()
+# plt.plot(tt,catt[2]+np.array(rla).T[1],label="RL")
+# plt.plot(tt,catt[2]+np.array(pla).T[1],label="PID")
+# plt.plot(tt,catt[2],label="actual",color="k")
+# plt.title("sweep duty")
+# plt.legend()
+# plt.grid(True)
+# %% Final Episode Plots New (Out)
+# size=time_final
+# e=ep
+
+# plt.figure()
+# plt.plot(tt[0:len(catt[0][0+size*e:-1])],catt[0][0+size*e:-1],color='C0',label='Feed')
+# plt.plot(tt[0:len(cattsp[0][0+size*e:-1])],cattsp[0][0+size*e:-1],linestyle=':',color='C0',label='Feed Target')
+# plt.title(f'Cell Potential {e}')
+# plt.grid(True)
+# if ramp_lines:
+#     for xc in time_set_tick[1:-1]:
+#         plt.axvline(x=xc/60,linestyle='--',color='k')
+# # plt.legend()
+
+
+# plt.figure()
+# plt.plot(tt[0:len(catt[1][0+size*e:-1])],catt[1][0+size*e:-1],color='C0',label='Feed')
+# plt.plot(tt[0:len(cattsp[1][0+size*e:-1])],cattsp[1][0+size*e:-1],linestyle=':',color='C0',label='Feed Target')
+# plt.plot(tt[0:len(catt[2][0+size*e:-1])],catt[2][0+size*e:-1],color='C1',label='Sweep')
+# plt.plot(tt[0:len(cattsp[2][0+size*e:-1])],cattsp[2][0+size*e:-1],linestyle=':',color='C1',label='Sweep Target')
+# plt.title(f'Inner Controller Heat Duty {e}')
+# plt.legend()
+# plt.grid(True)
+# if ramp_lines:
+#     for xc in time_set_tick[1:-1]:
+#         plt.axvline(x=xc/60,linestyle='--',color='k')
+
+# plt.figure()
+# plt.plot(tt[0:len(catt[3][0+size*e:-1])],catt[3][0+size*e:-1],color='C0',label='Feed')
+# plt.plot(tt[0:len(cattsp[3][0+size*e:-1])],cattsp[3][0+size*e:-1],linestyle=':',color='C0',label='Feed Target')
+# plt.plot(tt[0:len(catt[4][0+size*e:-1])],catt[4][0+size*e:-1],color='C1',label='Sweep')
+# plt.plot(tt[0:len(cattsp[4][0+size*e:-1])],cattsp[4][0+size*e:-1],linestyle=':',color='C1',label='Sweep Target')
+# plt.title(f'SOC Inlet Temperature {e}')
+# plt.legend()
+# plt.grid(True)
+# if ramp_lines:
+#     for xc in time_set_tick[1:-1]:
+#         plt.axvline(x=xc/60,linestyle='--',color='k')
+
+
+# plt.figure()
+# plt.plot(tt[0:len(catt[5][0+size*e:-1])],catt[5][0+size*e:-1],color='C0',label='Feed')
+# plt.plot(tt[0:len(cattsp[5][0+size*e:-1])],cattsp[5][0+size*e:-1],linestyle=':',color='C0',label='Feed Target')
+# plt.plot(tt[0:len(catt[6][0+size*e:-1])],catt[6][0+size*e:-1],color='C1',label='Sweep')
+# plt.plot(tt[0:len(cattsp[6][0+size*e:-1])],cattsp[6][0+size*e:-1],linestyle=':',color='C1',label='Sweep Target')
+# plt.title(f'SOC Outlet Temperature {e}')
+# plt.legend()
+# plt.grid(True)
+# if ramp_lines:
+#     for xc in time_set_tick[1:-1]:
+#         plt.axvline(x=xc/60,linestyle='--',color='k')
+
+
+# theta = np.linspace( 0 , 2 * np.pi , 150 )
+# # radius_c = scls[0].act(radius+scls[0].norm(0))
+# a = radius * np.cos( theta )
+# b = radius * np.sin( theta )
+
+# plt.figure()
+# plt.plot(catt[12][0+size*e:-1],catt[13][0+size*e:-1])
+# plt.plot(a,b)
+# plt.grid(True)
+# plt.title('distance')
+
+# %% Final Episode Plots 
+size=time_final
+e=ep
+
+pts=-60*10-1
+size=abs(pts+1)
+
+plt.figure()
+plt.plot(tt[0:size],catt[0][pts:-1],color='C0',label='Feed')
+plt.plot(tt[0:size],cattsp[0][pts:-1],linestyle=':',color='C0',label='Feed Target')
+plt.title(f'Cell Potential {e}')
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+# plt.legend()``
+
+
+plt.figure()
+plt.plot(tt[0:size],catt[1][pts:-1],color='C0',label='Feed')
+plt.plot(tt[0:size],cattsp[1][pts:-1],linestyle=':',color='C0',label='Feed Target')
+plt.plot(tt[0:size],catt[2][pts:-1],color='C1',label='Sweep')
+plt.plot(tt[0:size],cattsp[2][pts:-1],linestyle=':',color='C1',label='Sweep Target')
+plt.title(f'Inner Controller Heat Duty {e}')
+plt.legend()
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+
+plt.figure()
+plt.plot(tt[0:size],catt[3][pts:-1],color='C0',label='Feed')
+plt.plot(tt[0:size],cattsp[3][pts:-1],linestyle=':',color='C0',label='Feed Target')
+plt.plot(tt[0:size],catt[4][pts:-1],color='C1',label='Sweep')
+plt.plot(tt[0:size],cattsp[4][pts:-1],linestyle=':',color='C1',label='Sweep Target')
+plt.title(f'SOC Inlet Temperature {e}')
+plt.legend()
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+
+
+plt.figure()
+plt.plot(tt[0:size],catt[5][pts:-1],color='C0',label='Feed')
+plt.plot(tt[0:size],cattsp[5][pts:-1],linestyle=':',color='C0',label='Feed Target')
+plt.plot(tt[0:size],catt[6][pts:-1],color='C1',label='Sweep')
+plt.plot(tt[0:size],cattsp[6][pts:-1],linestyle=':',color='C1',label='Sweep Target')
+plt.title(f'SOC Outlet Temperature {e}')
+plt.legend()
+plt.grid(True)
+if ramp_lines:
+    for xc in time_set_tick[1:-1]:
+        plt.axvline(x=xc/60,linestyle='--',color='k')
+
+plt.figure()
+plt.plot(tt[0:size],bcatlong[pts:-1],color='C0',label='beta')
+
+# %% Episode Plots (OUt)
+
+
+# # for e in range(ep+1):
+#     plt.figure()
+#     plt.plot(tt[0:size],catt[0][0+size*e:size+size*(e)],color='C0',label='Feed')
+#     plt.plot(tt[0:size],cattsp[0][0+size*e:size+size*(e)],linestyle=':',color='C0',label='Feed Target')
+#     plt.title(f'Cell Potential {e}')
+#     plt.grid(True)
+#     # for xc in time_set_tick[1:-1]:
+#     #     plt.axvline(x=xc/60,linestyle='--',color='k')
+#     plt.legend()
+#     # plt.ylim([.6,1.5])
+# # for e in range(ep+1):
+#     plt.figure()
+#     plt.plot(tt[0:size],catt[1][0+size*e:size+size*(e)],color='C0',label='Feed')
+#     plt.plot(tt[0:size],cattsp[1][0+size*e:size+size*(e)],linestyle=':',color='C0',label='Feed Target')
+#     plt.plot(tt[0:size],catt[2][0+size*e:size+size*(e)],color='C1',label='Sweep')
+#     plt.plot(tt[0:size],cattsp[2][0+size*e:size+size*(e)],linestyle=':',color='C1',label='Sweep Target')
+#     plt.title(f'Inner Controller Heat Duty {e}')
+#     plt.legend()
+#     plt.grid(True)
+#     # for xc in time_set_tick[1:-1]:
+#     #     plt.axvline(x=xc/60,linestyle='--',color='k')
+# # for e in range(ep+1):
+#     plt.figure()
+#     plt.plot(tt[0:size],catt[3][0+size*e:size+size*(e)],color='C0',label='Feed')
+#     plt.plot(tt[0:size],cattsp[3][0+size*e:size+size*(e)],linestyle=':',color='C0',label='Feed Target')
+#     plt.plot(tt[0:size],catt[4][0+size*e:size+size*(e)],color='C1',label='Sweep')
+#     plt.plot(tt[0:size],cattsp[4][0+size*e:size+size*(e)],linestyle=':',color='C1',label='Sweep Target')
+#     plt.title(f'SOC Inlet Temperature {e}')
+#     plt.legend()
+#     plt.grid(True)
+#     for xc in time_set_tick[1:-1]:
+#         plt.axvline(x=xc/60,linestyle='--',color='k')
+#     # plt.ylim([850,1150])
+# # for e in range(ep+1):
+#     plt.figure()
+#     plt.plot(tt[0:size],catt[5][0+size*e:size+size*(e)],color='C0',label='Feed')
+#     plt.plot(tt[0:size],cattsp[5][0+size*e:size+size*(e)],linestyle=':',color='C0',label='Feed Target')
+#     plt.plot(tt[0:size],catt[6][0+size*e:size+size*(e)],color='C1',label='Sweep')
+#     plt.plot(tt[0:size],cattsp[6][0+size*e:size+size*(e)],linestyle=':',color='C1',label='Sweep Target')
+#     plt.title(f'SOC Outlet Temperature {e}')
+#     plt.legend()
+#     plt.grid(True)
+#     for xc in time_set_tick[1:-1]:
+#         plt.axvline(x=xc/60,linestyle='--',color='k')
+#     # plt.ylim([900,1100])
+
+
+# %% PLot BCAT
+
+x=np.array([np.linspace(0,1,100)])
+xx=expand(x)
+y=[]
+plt.figure()
+plt.title('G')
+for i in B.Wcat[:]:
+    y.append(np.dot(np.array(i),xx))
+    
+    plt.plot(x.T,y[-1].T)
+    # plt.plot(B.catL[:,1],B.catL[:,0],linestyle='None',marker='.')
+    # plt.ylim([-0.5, 1])
+
+xxL=expand_linear(x)
+y2=[]
+plt.figure()
+plt.title('M')
+for i in B.Mwcat[:]:
+    y2.append(np.dot(np.array(i),xxL))
+    
+    plt.plot(x.T,y2[-1].T)
+ 
+
+y3=[]
+plt.figure()
+plt.title('M_p')
+for i in B.Mpwcat[:]:
+    y3.append(np.dot(np.array(i),xx))
+    
+    plt.plot(x.T,y3[-1].T)
+
+
+plt.figure()
+plt.plot(x.T,y2[-1].T,label='M long',color='k')
+plt.plot(x.T,y3[-1].T,label='Mp long',color='k',linestyle=':')
+plt.plot(x.T,y[-1].T,label='G short',color='C0')
+plt.plot(B.catL[:,1],B.catL[:,0],linestyle='None',marker='.',color='k',label='long')
+plt.plot(B.cat[:,1],B.cat[:,0],linestyle='None',marker='.',color='C0',label='short')
+plt.legend()
+
+mm=np.array(B.Mcat)
+mm2=np.array(B.Gcat)
+mm3=np.array(B.Mpcat)
+plt.figure()
+plt.plot(mm, label='M')
+plt.plot(mm3, label='M_p')
+plt.plot(mm2,label='G')
+# plt.title('M')
+plt.legend()
+
+pp=np.array(B.lookback).T
+plt.figure()
+plt.plot(pp[0],label='PID')
+plt.plot(pp[1],label='M')
+plt.plot(pp[2],label='RL')
+plt.legend()
+plt.figure()
+plt.plot(bcatlong)
+plt.title('beta')
+
+# %% Ptrint Results
+
+print(np.mean(np.abs(rcatlong)))
+print('BE',B.BE)
+print('')
+
+
+# %% print slice 1
+
+start=20*time_final
+end=30*time_final
+
+# start=-10*tend
+# end=-1
+
+# start=-30*60
+# end=start+20*60
+
+# start=0
+# end=10*tend
+
+
+plt.figure()
+plt.plot(catt[5][start:end],color='C0',label='Feed')
+plt.plot(cattsp[5][start:end],linestyle=':',color='C0',label='Feed Target')
+plt.plot(catt[6][start:end],color='C1',label='Sweep')
+plt.plot(cattsp[6][start:end],linestyle=':',color='C1',label='Sweep Target')
+plt.title('continuous state START')
+# plt.title('SOC Outlet Temperature')
+plt.ylabel('Temperature (C)')
+plt.legend()
+plt.grid(True)
+plt.xlabel('Time (min)')
+
+
+
+# plt.figure()
+# plt.plot(acont[start:end])
+# plt.title('continuous action START')
+
+# plt.figure()
+# plt.plot(danormcon[start:end], label='RL')
+# plt.plot(danormcon2[start:end], label='PID')
+# plt.plot(danormcon3[start:end], label='act')
+# plt.plot(danormcon4[start:end], label='act w Noise')
+# plt.legend()
+# plt.title('dA actions START')
+
+plt.figure()
+plt.plot(pp[0][start:end],label='PID')
+plt.plot(pp[1][start:end],label='M')
+plt.plot(pp[2][start:end],label='RL')
+plt.legend()
+
+plt.figure()
+plt.plot(bcatlong[start:end])
+plt.title('beta START')
+plt.ylim([-0.1,1.1])
+
+# plt.figure()
+# plt.plot(np.array(danormcon3[start:end])-np.array(danormcon4[start:end]))
+
+plt.figure()
+plt.plot(rcatlong[start:end])
+plt.title('error START')
+
+print(np.mean(np.abs(rcatlong[start:end])))
+
+
+# %% print slice 2
+start2=-10*time_final
+end2=-1
+
+plt.figure()
+plt.plot(catt[5][start2:end2],color='C0',label='Feed')
+plt.plot(cattsp[5][start2:end2],linestyle=':',color='C0',label='Feed Target')
+plt.plot(catt[6][start2:end2],color='C1',label='Sweep')
+plt.plot(cattsp[6][start2:end2],linestyle=':',color='C1',label='Sweep Target')
+plt.title('continuous state END')
+# plt.title('SOC Outlet Temperature')
+plt.ylabel('Temperature (C)')
+plt.legend()
+plt.grid(True)
+plt.xlabel('Time (min)')
+
+
+
+# plt.figure()
+# plt.plot(acont[start2:end2])
+# plt.title('continuous action END')
+
+# plt.figure()
+# plt.plot(danormcon[start2:end2], label='RL')
+# plt.plot(danormcon2[start2:end2], label='PID')
+# plt.plot(danormcon3[start2:end2], label='act')
+# plt.plot(danormcon4[start2:end2], label='act w Noise')
+# plt.legend()
+# plt.title('dA actions END')
+
+plt.figure()
+plt.plot(pp[0][start2:end2],label='PID')
+plt.plot(pp[1][start2:end2],label='M')
+plt.plot(pp[2][start2:end2],label='RL')
+plt.legend()
+
+plt.figure()
+plt.plot(bcatlong[start2:end2])
+plt.title('beta END')
+plt.ylim([-0.1,1.1])
+
+# plt.figure()
+# plt.plot(np.array(danormcon3[start:end])-np.array(danormcon4[start:end]))
+
+plt.figure()
+plt.plot(rcatlong[start2:end2])
+plt.title('error END')
+
+# print(np.mean(np.abs(ecatlong[start2:end2])))
+
+# %% Combine
+Bb=[]
+mds=180
+# for i in range(len(bcatlong[start:end])):
+#     if i<mds:
+#         Bb.append([np.median(np.abs(bcatlong[start:end][0:i])), np.median(np.abs(bcatlong[start2:end2][0:i]))] )
+#     else:
+#         Bb.append([np.median(bcatlong[start:end][i-mds:i]), np.median(bcatlong[start2:end2][i-mds:i])])
+
+for i in range(len(bcatlong[start:end])):
+    if i<mds:
+        Bb.append([np.mean(np.abs(bcatlong[start:end][0:i])), np.mean(np.abs(bcatlong[start2:end2][0:i]))] )
+    else:
+        Bb.append([np.mean(bcatlong[start:end][i-mds:i]), np.mean(bcatlong[start2:end2][i-mds:i])])
+
+
+
+Ee=[]
+# mds=25
+# for i in range(len(ecatlong[start:end])):
+#     if i<mds:
+#         Ee.append([np.median(-np.abs(ecatlong[start:end][0:i])), np.median(-np.abs(ecatlong[start2:end2][0:i]))] )
+#     else:
+#         Ee.append([np.median(-np.abs(ecatlong[start:end][i-mds:i])), np.median(-np.abs(ecatlong[start2:end2][i-mds:i]))])
+
+for i in range(len(rcatlong[start:end])):
+    if i<mds:
+        Ee.append([np.mean(-np.abs(rcatlong[start:end][0:i])), np.mean(-np.abs(rcatlong[start2:end2][0:i]))] )
+    else:
+        Ee.append([np.mean(-np.abs(rcatlong[start:end][i-mds:i])), np.mean(-np.abs(rcatlong[start2:end2][i-mds:i]))])
+
+
+Bb_n=np.array(Bb)
+Ee_n=np.array(Ee)
+
+plt.figure()
+plt.plot(bcatlong[start:end],label='Start',color='C0')
+plt.plot(bcatlong[start2:end2],label='End', color='C1')
+plt.plot(Bb_n[:,0],label='Start M', color='C0',linestyle=':')
+plt.plot(Bb_n[:,1],label='End M',color='C1',linestyle=':')
+plt.legend()
+plt.title('Beta')
+plt.ylim([-0.1,1.1])
+
+plt.figure()
+# plt.plot(-np.abs(ecatlong[start:end]),label='Start', color='C0')
+# plt.plot(-np.abs(ecatlong[start2:end2]),label='End', color='C1')
+plt.plot(Ee_n[:,0],label='Start M', color='C0',linestyle=':')
+plt.plot(Ee_n[:,1],label='End M',color='C1',linestyle=':')
+plt.axhline(y=-0.08,linestyle='--',color='k',label='PID')
+plt.legend()
+plt.title('Error')
+
+plt.figure()
+plt.plot(-np.abs(rcatlong[start:end]),label='Start', color='C0')
+plt.plot(-np.abs(rcatlong[start2:end2]),label='End', color='C1')
+# plt.plot(Ee_n[:,0],label='Start Median', color='C0',linestyle=':')
+# plt.plot(Ee_n[:,1],label='End Median',color='C1',linestyle=':')
+plt.legend()
+plt.title('Error')
+
+
+# %% median error and beta
+
+ccc=[]
+mds=500
+for i in range(len(bcatlong)):
+    if i<mds:
+        ccc.append(np.median(bcatlong[0:i]))
+    else:
+        ccc.append(np.median(bcatlong[i-mds:i]))
+
+plt.figure()
+plt.plot(bcatlong[:])
+plt.plot(ccc)
+plt.title('beta')
+
+ccc=[]
+# mds=25
+for i in range(len(rcatlong)):
+    if i<mds:
+        ccc.append(np.median(rcatlong[0:i]))
+    else:
+        ccc.append(np.median(rcatlong[i-mds:i]))
+
+
+plt.figure()
+plt.plot(rcatlong[:])
+plt.plot(ccc)
+# plt.ylim([-0.05,0.05])
+
+
+
+# %% Saves
+
+
+datfile=[tt, catt, cattsp, rcatep, rcatlong, bcatep, bcat, bcatlong, time_set_tick, time_final, epmax, noise_cat, action, rla, pla, reset, PoorR_Log]
+setfile=[on_noise, on_reset, on_bep, bepref, save_nn, mode_sw, sp_sw, petsc_on, var_solve]
+
+betafile=[[start,end],[start2,end2],bcatlong,rcatlong,pp,[B.BE,B.cap,B.capL,B.time,B.timeL,B.phi,B.phi2],B.cat,B.catL,[B.Wcat,B.Mwcat,B.Mpwcat],[B.Gcat,B.Mcat,B.Mpcat]]
+
+# nam_con="sp_sw_100ep_052523"   #12 states 2 actions
+# nam_con="sp_sw_100ep_052923"    #14 states (added error) 60 2 actions, limit du, weight regulatrization
+
+# nam_con="mode_sw_1ep_053123"   #12 states mode switch no limit du trained
+# nam_con="mode_sw_1ep_14s_053123"   #14 states mode switch limit du trained, regularlized
+
+# nam_con="mode_sw_1ep_PID_053123"   #PID results
+
+# nam_con="mode_sw_sqerror_100ep_060623"  #100 ep 14 states square error BAD
+# nam_con="mode_sw_sqerror_100ep2_060623"  #100 ep 14 states square error lower tau 100 ret scale
+
+# nam_con="Tservo_sqerror_50ep_n25_071323"  #50 episodes 14 states 2 action square error 25 noise Tservo
+# nam_con="Tservo_sqerror_100ep_n25_071323"  #50 episodes 14 states 2 action square error 25 noise Tservo
+# nam_con="Tservo_sqerror_40ep_n35_071423"  #40 episodes 14 states 2 action square error 35 noise Tservo
+
+# nam_con="sp_sw_sqerror_200ep_n08_080923"  #200 episodes 12 states 2 action square error 08 noise spsw all deviate
+
+
+# nam_con="sp_sw_absE_1000ep_n15_092723_1"  #BROKEN 1000 episodes 12 states 2 action abs error 15 noise spsw all deviate
+# nam_con="sp_sw_absE_1000ep_n15_092723"  #1000 episodes 12 states 2 action abs error 15 noise spsw all deviate
+# nam_con="sp_sw_absE_1000ep_n15_092723_reset"  #BROKEN 1000 episodes 12 states 2 action abs error 15 noise spsw all deviate
+
+# nam_con="sp_sw_RLtrial_5ep_100223"
+# nam_con="Tservo_RLtrial_5ep_100223"
+# nam_con="sp_sw_RL_PIDtrial_5ep_100223"
+# nam_con="Tservo_RL_PIDtrial_5ep_100223"
+# nam_con="sp_sw_PIDtrial_5ep_100223"
+# nam_con="Tservo_PIDtrial_5ep_100223"
+
+
+# nam_con="sp_sw_RL_PIDnewtrial_5ep_103023"  #newest RLPID formulation
+# nam_con="sp_sw_RL_PIDnewtrial_5ep_110123"  #newest RLPID formulation
+
+
+
+# nam_con="mode_sw_1ep_500time_PID_101223"   #PID results
+# nam_con="mode_sw_1ep_500time_RL_101223"   #RL results
+# nam_con="mode_sw_1ep_500time_RLPID_d999_101423"   #RLPID results
+# nam_con="mode_sw_1ep_500time_RLPID_d99_101423"   #RLPID results
+
+# nam_con="mode_sw_1ep_500time_RLPID_Newtrial_110123"   #newest RLPID formulation
+
+
+
+# nam_con="sp_sw_absE_2000ep_n15_100223_1"  #2000 episodes 12 states 2 action abs error 15 noise spsw all deviate
+# nam_con="sp_sw_absE_2000ep_n15_100223_2"  #2000 episodes 12 states 2 action abs error 15 noise spsw all deviate
+
+# nam_con="sp_sw_absE_RLPID_1000ep_n15_100423"  #1000 episodes 12 states 2 action abs error 15 noise spsw all deviate
+# nam_con="sp_sw_absE_RLnores_1000ep_n15_101123"  #1000 episodes 12 states 2 action abs error 15 noise spsw all deviate NO RESET at 0.1
+
+# nam_con="sp_sw_1000ep_RLPID_betafunc_121223"
+
+
+if save_data==1:
+    pfile=(r"G:\My Drive\Python Scripts\interactive window\datfile_"+nam_con+".pkl")
+    with open(pfile, "wb") as pkl_wb_obj:
+        pickle.dump(datfile,pkl_wb_obj)
+
+    pfile2=(r"G:\My Drive\Python Scripts\interactive window\setfile_"+nam_con+".pkl")
+    with open(pfile2, "wb") as pkl_wb_obj:
+        pickle.dump(setfile,pkl_wb_obj)
+
+    pfile3=(r"G:\My Drive\Python Scripts\interactive window\betafile_"+nam_con+".pkl")
+    with open(pfile3, "wb") as pkl_wb_obj:
+        pickle.dump(betafile,pkl_wb_obj)
+
+    
+
+# with open(pfile, "rb") as pkl_rb_obj:
+# 	data = pickle.load(pkl_rb_obj)
+# print(cttp)
+
+# with open(pfile2, "rb") as pkl_rb_obj:
+# 	set = pickle.load(pkl_rb_obj)
+# print(cttp)
+
+
+
+# %%
+
+# Reward is absolute plus absolute. Noise is 0.15 OU process
+
+# buffdat=[DDPG.RB.state_buffer, DDPG.RB.action_buffer, DDPG.RB.reward_buffer, DDPG.RB.next_state_buffer]
+# bufferset='Buff100ep015n.pkl'
+# with open(bufferset,'wb') as pkl_wb_obj:
+#     pickle.dump(buffdat,pkl_wb_obj)
+
+# %% OUA tester
+epmm=450
+tfff=30
+
+
+ddd=OUActionNoise(np.array(0),sigma_max=0.05, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmm*tfff)
+asd=[]
+
+for i in range(epmm*tfff):
+    asd.append(ddd(i))
+
+plt.plot(asd)
+
+# %%  Open looks OUT??????
+# nam_con="sp_sw_sqerror_200ep_n08_080923"
+
+pfile="datfile_"+nam_con+".pkl"
+pfile2="setfile_"+nam_con+".pkl"
+with open(pfile, "rb") as pkl_rb_obj:
+    data = pickle.load(pkl_rb_obj)
+    
+with open(pfile2, "rb") as pkl_rb_obj:
+    settings = pickle.load(pkl_rb_obj)
+
+tt=data[0]
+catt=data[1]
+cattsp=data[2]
+rcatep=data[3]
+rcatlong=data[4]
+bcatep=data[5]
+bcat=data[6]
+bcatlong=data[7]
+time_set_tick=data[8]
+time_final=data[9]
+epmax=data[10]
+
+
+
+cn=[]
+for j,k in enumerate(catt):
+    cn.append([scls[j].norm(i) for i in k])
+
+
+
+# df = pd.DataFrame(cn)
+# df.to_csv(r'sp_sw_100_2.csv')
+# %%
+recoR=[]
+recoS=[]
+
+rname=[alias_dict[var] for var in ramp_mvs]
+sname=[alias_dict[var] for var in step_mvs]
+
+for i in range(round(time_set_tick[-1]/60)):
+
+    ramps=[]
+    steps=[]
+    for count,z in enumerate(time_set_tick):
+        if i==z/60:
+            rmp=count
+            trmp=(time_set_tick[count+1]-time_set_tick[count])/60  ###################################################
+            j=0
+    for var in ramp_mvs:
+            shortname = var.name.split(".")[-1]
+            alias = alias_dict[var]
+            blk = var.parent_block()
+            nwsp=df[alias][sp2[rmp-1]]+ j*60*(df[alias][sp2[rmp]]-df[alias][sp2[rmp-1]])/(trmp*60)
+
+            ramps.append(nwsp)
+            # print(var)
+            # var[:].fix(float(nwsp))
+    for var in step_mvs:
+            shortname = var.name.split(".")[-1]
+            alias = alias_dict[var]
+
+            steps.append(float(df[alias][sp2[rmp]]))
+            # nwsp2=df[alias][sp2[rmp-1]]+ j*60*(df[alias][sp2[rmp]]-df[alias][sp2[rmp-1]])/(trmp*60)
+            # var[:].fix(float(nwsp2))
+
+            # var[:].fix(float(df[alias][sp2[rmp]]))
+    recoR.append(ramps)
+    recoS.append(steps)
+    j+=1
+
+prR=np.array(recoR).T
+prS=np.array(recoS).T
+
+
+# fs.feed_recycle_split.recycle_ratio 0
+# fs.sweep_recycle_split.recycle_ratio 1
+# fs.condenser_split.recycle_ratio 2
+# fs.condenser_flash.split._Vap_temperature_ref 3
+# fs.feed_heater_inner_controller.mv_ref 4
+# fs.sweep_heater_inner_controller.mv_ref 5
+# fs.feed_heater_outer_controller.setpoint 6
+# fs.feed_heater_outer_controller.mv_ref 7
+# fs.sweep_heater_outer_controller.setpoint 8
+# fs.sweep_heater_outer_controller.mv_ref 9
+# fs.voltage_controller.setpoint 10
+# fs.voltage_controller.mv_ref 11
+# fs.sweep_blower_controller.setpoint 12
+# fs.sweep_blower_controller.mv_ref 13
+# fs.h2_production_rate_controller.mv_ref 14
+
+# fs.makeup_mix.makeup_mole_frac_comp_H2
+# fs.makeup_mix.makeup_mole_frac_comp_H2O
+# fs.h2_production_rate_controller.setpoint
+# fs.h2_production_rate_controller.gain_p
+# uuu=1
+for uuu in range(len(rname)):
+    plt.figure()
+    plt.plot(prR[uuu])
+    plt.title(rname[uuu])
+
+for uuu in range(len(sname)):
+    plt.figure()
+    plt.plot(prS[uuu])
+    plt.title(sname[uuu])
+
+
+
+
+
+# %%
+

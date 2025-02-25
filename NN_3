@@ -1,0 +1,231 @@
+# %%
+import os
+import time
+from enum import Enum
+import pandas as pd
+import numpy as np
+import pyomo.environ as pyo
+
+
+from pyomo.dae import ContinuousSet, DerivativeVar
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+from pyomo.dae.flatten import flatten_dae_components
+from scipy.io import loadmat
+import random
+import copy as copy
+import torch
+import torch.nn as nn
+import math
+from torch.utils.data import TensorDataset, DataLoader
+
+# %%
+
+class layer:
+    def __init__(self,input,output,type):
+        self.type=type
+        self.w=np.ones((output,input))
+        self.wder=np.zeros((output,input))
+        self.b=np.zeros((output,1))
+        self.bder=np.zeros((output,1))
+        if self.type=='relu':
+            for i in range(self.w.shape[0]):
+                for j in range(self.w.shape[1]):
+                    self.w[i,j]=np.random.randn()*np.sqrt((2/input))
+        elif self.type=='tanh' or self.type=='sin':
+            for i in range(self.w.shape[0]):
+                for j in range(self.w.shape[1]):
+                    self.w[i,j]=np.random.uniform(-np.sqrt(6)/np.sqrt(output+input),np.sqrt(6)/np.sqrt(output+input))
+                    # self.w[i,j]=np.random.uniform(-1/np.sqrt(input),1/np.sqrt(input))
+        
+    def fforward(self,input):
+        self.ain=input
+        if self.type=='linear':
+            self.aout=self.w@self.ain+self.b
+        elif self.type=='relu':
+            temp=self.w@self.ain+self.b
+            self.aout=np.maximum(temp,0)
+        elif self.type=='tanh':
+            temp=self.w@self.ain+self.b
+            self.aout=np.tanh(temp)
+        elif self.type=='sin':
+            temp=self.w@self.ain+self.b
+            self.aout=temp+np.sin(temp)**2
+    
+    def bbackward(self,loss):
+        
+        if self.type=='linear':
+            
+            self.daout=loss
+            self.bder=np.sum(self.daout,axis=1,keepdims=True)
+            self.wder=np.dot(self.daout,self.ain.T)
+            self.dain=self.w.T@self.daout
+
+        elif self.type=='relu':
+            temp=np.ones(loss.shape)
+            temp[self.aout<0]=0
+            self.daout=np.multiply(loss,temp)
+            self.bder=np.sum(self.daout,axis=1,keepdims=True)
+            self.wder=np.dot(self.daout,self.ain.T)
+            self.dain=self.w.T@self.daout
+            
+
+        elif self.type=='tanh':
+            temp=1-self.aout**2
+            self.daout=np.multiply(loss,temp)
+            self.bder=np.sum(self.daout,axis=1,keepdims=True)
+            self.wder=np.dot(self.daout,self.ain.T)
+            self.dain=self.w.T@self.daout
+
+        elif self.type=='sin':
+            temp=2*self.aout+2*np.sin(self.aout)*np.cos(self.aout)
+            self.daout=np.multiply(loss,temp)
+            self.bder=np.sum(self.daout,axis=1,keepdims=True)
+            self.wder=np.dot(self.daout,self.ain.T)
+            self.dain=self.w.T@self.daout
+
+def createlayers(track,ttrack):
+    hold=[]
+    for i in range(len(track)):
+        hold.append(layer(track[i][0],track[i][1],ttrack[i]))
+    return hold
+
+class nn:
+    def __init__(self,track,ttrack,lr=1e-3):
+        self.batchcat=[]
+        self.net=createlayers(track,ttrack)
+        self.wgrads=[]
+        self.bgrads=[]
+        self.count=0
+        self.lr=lr
+        self.mw=[]
+        self.vw=[]
+        self.mb=[]
+        self.vb=[]
+        self.t=0
+    def forward(self,xin):
+        temp=xin
+        for i in range(len(self.net)):
+            self.net[i].fforward(temp)
+            temp=self.net[i].aout
+        return self.net[-1].aout
+    
+    def loss(self,actual, pred):
+        losscat=(actual-pred)**2
+        loss=np.sum((actual-pred)**2)/pred.size
+
+        self.L_avg=np.sum(-2*(actual-pred))/pred.size
+        self.lossder=-2*(actual-pred)
+        return loss, losscat
+    
+    def backward(self):
+        temp=self.lossder
+        for i in reversed(range(len(self.net))):
+            self.net[i].bbackward(temp)
+            temp=self.net[i].dain
+        
+       
+    
+    def update(self,batch):
+        B1=0.9
+        B2=0.999
+        eps=1e-8
+        self.batch=batch
+        self.batchcat.append(batch)
+        if self.t==0:
+            for i in range(len(self.net)):
+                self.mw.append(np.zeros(self.net[i].wder.shape))
+                self.vw.append(np.zeros(self.net[i].wder.shape))
+                self.mb.append(np.zeros(self.net[i].bder.shape))
+                self.vb.append(np.zeros(self.net[i].bder.shape))
+
+        
+        self.t+=1
+        for i in range(len(self.net)):
+            self.net[i].wder=self.net[i].wder/self.batch
+            self.net[i].bder=self.net[i].bder/self.batch
+
+            self.mw[i]=B1*self.mw[i]+(1-B1)*self.net[i].wder
+            self.mb[i]=B1*self.mb[i]+(1-B1)*self.net[i].bder
+            self.vw[i]=B2*self.vw[i]+(1-B2)*self.net[i].wder**2
+            self.vb[i]=B2*self.vb[i]+(1-B2)*self.net[i].bder**2
+            at=self.lr*np.sqrt(1-B2**self.t)/(1-B1**self.t)
+            
+            self.net[i].w=self.net[i].w-at*self.mw[i]/(np.sqrt(self.vw[i])+eps)
+            self.net[i].b=self.net[i].b-at*self.mb[i]/(np.sqrt(self.vb[i])+eps)
+        
+
+
+
+
+# x_train = np.array([[0,0], [0,1], [1,0], [1,1]]).T
+# y_train = np.array([[0], [1], [1], [0]]).T
+# %%
+pth=(r"G:\My Drive\Python Scripts\Class\Project3 NN\NN_proj_data_04.mat")
+
+Data=loadmat(pth)
+inp=Data['inp_train']
+inp_val=Data['inp_valid']
+out=Data['y4']
+out_val=Data['y4val']
+# %%
+# batch=81
+batch=16
+batchm=batch*2
+epmax=1000
+totep=epmax*81/batchm
+inp_t=torch.from_numpy(np.transpose(inp)).float()
+out_t=torch.from_numpy(np.transpose(out)).float()
+catt=torch.cat((inp_t,out_t),1)
+train_loader=DataLoader(catt,batch_size=batch, shuffle=True)
+
+track=[(1,100),(100,50),(50,25),(25,1)]
+ttrack=['sin','sin','tanh','linear']
+
+# track=[(1,50),(50,25),(25,1)]
+# ttrack=['tanh','tanh','linear']
+m=nn(track,ttrack,1e-3)
+
+# %%
+losscat=[]
+
+for ep in range(epmax):
+    print(ep/epmax)
+    print('------------------')
+    lossep=[]
+    for n,xbatch in enumerate(train_loader):
+        # print(xs.shape)
+        xs=xbatch.detach().numpy()
+        pred=m.forward(np.array([xs[:,0]]))
+        lssvg=m.loss(np.array([xs[:,1]]),pred)[0]
+        lossep.append(lssvg)
+        m.backward()
+        m.update(xs.shape[0])
+    losscat.append(np.mean(lossep))
+        
+# %%
+yout=m.forward(inp_val)
+# %%
+plt.figure()
+plt.plot(inp[0,:],out[0,:],'.',color='C0')
+plt.plot(inp_val[0,:],yout[0,:],color='C1')
+plt.figure()
+plt.plot(losscat)
+plt.xlabel('epoch')
+plt.ylabel('loss')
+plt.figure()
+plt.plot(inp_val[0,:],out_val[0,:],color='C0')
+plt.plot(inp_val[0,:],yout[0,:],color='C1')
+# %%
+
+overall=np.sum((out_val-yout)**2)/yout.size
+print(overall)
+overall_inter=np.sum((out_val[:,200:600]-yout[:,200:600])**2)/400
+print(overall_inter)
+overall_extr=(np.sum((out_val[:,:199]-yout[:,:199])**2)+np.sum((out_val[:,601:]-yout[:,601:])**2))/401
+print(overall_extr)
+# %%
+
+
+
+

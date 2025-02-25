@@ -1,0 +1,2522 @@
+# %%  Imports
+# Doesnt Work
+
+# %%
+
+from matplotlib.font_manager import FontProperties
+import numpy as np
+from numpy import random as rand
+from matplotlib import pyplot as plt
+import copy as copy
+import torch
+import torch.nn as nn
+import math
+import numpy as np
+from matplotlib import pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader
+from idaes.core.util.model_statistics import degrees_of_freedom
+from pyomo.environ import *
+from pyomo.environ import SolverFactory
+from pyomo.dae import *
+from pyomo.dae.simulator import Simulator
+from idaes.core import FlowsheetBlock
+import idaes.logger as idaeslog
+import copy as copy
+import os
+import time
+from enum import Enum
+import pandas as pd
+import numpy as np
+import pyomo.environ as pyo
+# from pyomo.repn.plugins import nl_writer
+# nl_writer._activate_nl_writer_version(2)
+from pyomo.common.fileutils import this_file_dir
+from pyomo.common.collections import ComponentSet, ComponentMap
+from pyomo.util.calc_var_value import calculate_variable_from_constraint
+import idaes
+import idaes.core.util.scaling as iscale
+from pyomo.dae import ContinuousSet, DerivativeVar
+from idaes.core.solvers import petsc
+import idaes.logger as idaeslog
+import idaes.core.util.model_serializer as ms
+from idaes.core.util.model_statistics import degrees_of_freedom as dof
+
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mtick
+from idaes.models.control.controller import ControllerType, ControllerMVBoundType, ControllerAntiwindupType
+
+from idaes.models.properties import iapws95
+from idaes.core.util.model_statistics import degrees_of_freedom as dof
+from pyomo.dae.flatten import flatten_dae_components
+from scipy.io import loadmat
+# from numpy import random as rand
+# from random import sample
+import random
+import copy as copy
+import torch
+import torch.nn as nn
+import math
+from matplotlib import pyplot as plt
+from torch.utils.data import TensorDataset, DataLoader
+import pickle
+
+# %%
+
+def gen_median(array, num=25):
+    out=[]
+    iqrcat=[]
+    outL=[]
+    outU=[]
+    for i in range(len(array)):
+        if i==0:
+            out.append(np.median(array[0:i]))
+            iqrcat.append(0)
+            outL.append(np.median(array[0:i]))
+            outU.append(np.median(array[0:i]))
+        elif i<num:
+            out.append(np.median(array[0:i]))
+            iqr = np.subtract(*np.percentile(array[0:i], [75, 25]))
+            outL.append(np.median(array[0:i])-iqr)
+            outU.append(np.median(array[0:i])+iqr)
+        else:
+            out.append(np.median(array[i-num:i]))
+            iqr = np.subtract(*np.percentile(array[i-num:i], [75, 25]))
+            iqrcat.append(iqr)
+            outL.append(np.median(array[i-num:i])-iqr)
+            outU.append(np.median(array[i-num:i])+iqr)
+
+    return out,outL,outU
+
+def gen_mean(array, num=25):
+    out=[]
+    for i in range(len(array)):
+        if i<num:
+            out.append(np.mean(array[0:i]))
+        else:
+            out.append(np.mean(array[i-num:i]))
+
+    return out
+
+# %%  CSTR model
+
+
+k10 = 1.287e12
+k20 = 1.287e12
+k30 = 9.043e9/1000
+E1 = -9758.3
+E2 = -9758.3
+E3 = -8560.0
+dHr1 = 4.2
+dHr2 = -11.0
+dHr3 = -41.85
+rho = 0.9342*1000
+Cp = 3.01
+kw = 4032.0
+A = 0.215
+V = 0.01
+mk = 5.0
+Cpk = 2.0
+    
+m=ConcreteModel()
+m.T=ContinuousSet(bounds=(0,1))  
+m.Cas = Var(m.T)
+m.Cb = Var(m.T)
+m.Ts = Var(m.T,bounds=(1e-6,None))
+
+
+m.Vdot = Var(m.T) #Flowrate
+m.Ca0 = Var(m.T)
+m.T0 = Var(m.T,bounds=(1e-6,None))
+m.Qk = Var(m.T)
+  
+def Rate_Constant_rule(m,i,t):
+        if i == 1:
+            return k10*exp(E1/(m.Ts[t]+0))
+        if i == 2:
+            return k20*exp(E2/(m.Ts[t]+0))
+        if i == 3:
+            return k30*exp(E3/(m.Ts[t]+0))
+m.k = Expression([1,2,3], m.T, rule=Rate_Constant_rule)
+        
+m.ode1 = DerivativeVar(m.Cas, wrt=m.T)
+m.ode2 = DerivativeVar(m.Cb, wrt=m.T)
+m.ode3 = DerivativeVar(m.Ts, wrt=m.T)
+
+    
+def ode1_con_rule(m,t):
+    return m.ode1[t] == (m.Vdot[t]/V)*(m.Ca0[t] - m.Cas[t]) - m.k[1,t]*m.Cas[t] - m.k[3,t]*m.Cas[t]**2
+m.ode1_con = Constraint(m.T, rule=ode1_con_rule)
+    
+def ode2_con_rule(m,t):
+    return m.ode2[t] == (m.Vdot[t]/V)*(-m.Cb[t]) + m.k[1,t]*m.Cas[t] - m.k[2,t]*m.Cb[t]
+m.ode2_con = Constraint(m.T, rule=ode2_con_rule)
+    
+def ode3_con_rule(m,t):
+    return m.ode3[t] == (m.Vdot[t]/V)*(m.T0[t] - m.Ts[t]) - (1/rho/Cp)*(m.k[1,t]*m.Cas[t]*dHr1 + m.k[2,t]*m.Cb[t]*dHr2 + m.k[3,t]*m.Cas[t]**2*dHr3) + m.Qk[t]/(rho*V*Cp)
+m.ode3_con = Constraint(m.T, rule=ode3_con_rule)
+      
+
+#Initial Conditions
+Cas0 = 2480.352472308917
+Cbs0 = 1066.6500000006338
+Ts0 = 382.4911339081059
+
+# Cas0 = 2480.34
+# Cbs0 = 1066.65
+# Ts0 = 382.49
+
+
+
+#Initization reactor states
+m.Cas[0].fix(Cas0)
+m.Cb[0].fix(Cbs0)
+m.Ts[0].fix(Ts0)
+
+Discretizer = TransformationFactory('dae.finite_difference')
+Discretizer.apply_to(m, wrt=m.T, nfe=60, scheme="BACKWARD")
+
+#Steady State Input
+for t in m.T:
+    m.Vdot[t] = 0.1419
+    
+    
+    m.Qk[t] = -2811.9
+    m.Ca0[t] = 5100
+    m.T0[t] = 378.05
+
+    m.Vdot[t].fix()
+    m.Qk[t].fix()
+    m.Ca0[t].fix()
+    m.T0[t].fix()
+
+
+
+
+Solver= SolverFactory('ipopt')
+Solver.options['halt_on_ampl_error']='yes'
+Solver.solve(m, tee=True)
+
+
+# %% RL Funct
+
+# RL Functions
+
+
+class scale_fun_htan:
+    def __init__(self,low,high):
+        self.high=high
+        self.low=low
+
+        self.ka=(self.high-self.low)/2
+        self.ba=(self.high+self.low)/2
+    def act(self, anorm):
+        aact=self.ka*anorm+self.ba
+        return aact    
+    def norm(self, aact):
+        anorm=(aact-self.ba)/self.ka
+        return anorm
+    
+class scale_fun_sig:
+    def __init__(self,low,high):
+        self.high=high
+        self.low=low
+
+        self.ka=(self.high-self.low)/1
+        self.ba=self.low
+    def act(self, anorm):
+        aact=self.ka*anorm+self.ba
+        return aact    
+    def norm(self, aact):
+        anorm=(aact-self.ba)/self.ka
+        return anorm
+
+def create_scales_sig(lbs,ubs):
+    h=[]
+    for i in range(len(lbs)):
+        h.append(scale_fun_sig(lbs[i],ubs[i]))
+    return h
+
+def create_scales_tanh(lbs,ubs):
+    h=[]
+    for i in range(len(lbs)):
+        h.append(scale_fun_htan(lbs[i],ubs[i]))
+    return h
+
+class Buffer:
+    def __init__(self, n_states=1, n_actions=1, buffer_capacity=100000, batch_size=64):
+        # Number of "experiences" to store at max
+        self.buffer_capacity = buffer_capacity
+        # Num of tuples to train on.
+        self.batch_size = batch_size
+
+        # Its tells us num of times record() was called.
+        self.buffer_counter = 0
+
+        # Instead of list of tuples as the exp.replay concept go
+        # We use different np.arrays for each tuple element
+        self.state_buffer = []
+        self.action_buffer = []
+        self.reward_buffer = []
+        self.next_state_buffer = []
+        self.on = 0
+        # self.state_buffer = np.zeros((self.buffer_capacity, n_states))
+        # self.action_buffer = np.zeros((self.buffer_capacity, n_actions))
+        # self.reward_buffer = np.zeros((self.buffer_capacity, 1))
+        # self.next_state_buffer = np.zeros((self.buffer_capacity, num_states))
+
+    # Takes (s,a,r,s') obervation tuple as input
+    def record(self, obs_tuple):
+        # Set index to zero if buffer_capacity is exceeded,
+        # replacing old records
+        index = self.buffer_counter % self.buffer_capacity
+        
+        if self.buffer_counter > 0 and index==0:
+            self.on=1
+        if self.on==1:
+            self.state_buffer[index] = obs_tuple[0]
+            self.action_buffer[index] = obs_tuple[1]
+            self.reward_buffer[index] = obs_tuple[2]
+            self.next_state_buffer[index] = obs_tuple[3]
+        else:
+            self.state_buffer.append(obs_tuple[0])
+            self.action_buffer.append(obs_tuple[1])
+            self.reward_buffer.append(obs_tuple[2])
+            self.next_state_buffer.append(obs_tuple[3])
+
+        self.buffer_counter += 1
+        
+    def get_batch(self):
+        states=[]
+        actions=[]
+        rewards=[]
+        next_states=[]
+        
+        
+        if self.buffer_counter < self.batch_size:
+            states=self.state_buffer
+            actions=self.action_buffer
+            rewards=self.reward_buffer
+            next_states=self.next_state_buffer
+        else:
+            select=random.sample(range(len(self.state_buffer)),self.batch_size)
+            
+            for i in select:
+                states.append(self.state_buffer[i])
+                actions.append(self.action_buffer[i])
+                rewards.append(self.reward_buffer[i])
+                next_states.append(self.next_state_buffer[i])
+        return states, actions, rewards, next_states
+
+class policy(nn.Module):
+    def __init__(self,n_states,n_actions):
+        super(policy, self).__init__()
+        
+        self.stack=nn.Sequential(nn.Linear(n_states,100),
+                                    nn.ReLU(),
+                                    # nn.ReLU(),
+                                    # nn.ReLU(),
+                                      nn.Linear(100, 75),
+                                      nn.ReLU(),
+                                    nn.Linear(75,n_actions),
+                                    # nn.Tanh()
+                                    nn.Sigmoid()
+                                    )       
+        
+
+        # self.stack=nn.Sequential(nn.Linear(n_states,1280),
+        #                       nn.ReLU(),
+        #                       nn.Linear(1280, 128),
+        #                       nn.ReLU(),
+        #                       nn.Linear(128, 64),
+        #                       nn.ReLU(),
+        #                       nn.Linear(64,n_actions),
+        #                       nn.Tanh() #nn.Sigmoid()
+        #                       )       
+        
+    def forward(self,x):
+        y=self.stack(x)
+        return y
+        
+class Qfun(nn.Module):
+    def __init__(self, n_states, n_actions):
+        super(Qfun,self).__init__()
+        
+        self.stack1=nn.Sequential(nn.Linear(n_states,100),
+                              nn.ReLU(),
+                              nn.ReLU(),
+                            #   nn.Sigmoid(),
+                            #   nn.Linear(640, 128),
+                            #   nn.ReLU(),
+                              )
+        
+        
+        self.stack2=nn.Sequential(nn.Linear(n_actions,100),
+                              nn.ReLU(),
+                            #   nn.ReLU(),
+                            #   nn.Sigmoid(),
+                            #   nn.Linear(640, 128),
+                            #   nn.ReLU(),
+                              )
+        
+        self.stack3=nn.Sequential(nn.Linear(100*2, 100),
+                                  nn.ReLU(),
+                                  nn.ReLU(),
+                                  nn.Linear(100,1))
+        
+
+
+        # self.stack1=nn.Sequential(nn.Linear(n_states,640),
+        #                       nn.ReLU(),
+        #                       nn.Linear(640, 128),
+        #                       nn.ReLU(),
+        #                       )
+        
+        
+        # self.stack2=nn.Sequential(nn.Linear(n_actions,640),
+        #                       nn.ReLU(),
+        #                       nn.Linear(640, 128),
+        #                       nn.ReLU(),
+        #                       )
+        
+        # self.stack3=nn.Sequential(nn.Linear(128*2, 64),
+        #                           nn.ReLU(),
+        #                           nn.Linear(64,1))
+        
+    def forward(self,s,a):
+        s1=self.stack1(s)
+        a1=self.stack2(a)
+        z=torch.cat((s1,a1),len(s1.size())-1)
+        # z=torch.cat((s1,a1),1)
+        # z=torch.cat((s1,a1))
+        out=self.stack3(z)
+        return out
+
+class DDPGagent:
+    def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
+        # Params
+        self.num_states = n_states
+        self.num_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+
+        self.c_L=[]
+        self.p_L=[]
+
+        # Networks
+        self.actor = policy(self.num_states,self.num_actions)
+        self.actor_target = policy(self.num_states,self.num_actions)
+        self.critic = Qfun(self.num_states, self.num_actions)
+        self.critic_target = Qfun(self.num_states, self.num_actions)
+
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data)
+        
+        # Training
+        self.RB = Buffer(self.num_states,self.num_actions,buffer_capacity)        
+        self.critic_loss  = nn.MSELoss()
+        self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+        self.critic_opt= torch.optim.Adam(self.critic.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+    
+    def get_action(self, state):
+        state = torch.tensor([state]).float()
+        action = self.actor.forward(state)
+        action = np.squeeze(action.detach().numpy())
+        # action=np.ndarray.item(action)
+        return action
+    
+    def update(self):
+        states, actions, rewards, next_states = self.RB.get_batch()
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+        # Critic loss        
+        Qvals = self.critic.forward(states, actions)
+        next_actions = self.actor_target.forward(next_states)
+        next_Q = self.critic_target.forward(next_states, next_actions.detach())
+        Qprime = rewards + self.gamma * next_Q
+        critic_loss = self.critic_loss(Qvals, Qprime)
+        self.c_L.append(critic_loss.detach().numpy())
+
+        # Actor loss
+        policy_loss = -self.critic.forward(states, self.actor.forward(states)).mean()
+        self.p_L.append(policy_loss.detach().numpy())
+
+        # update networks
+        self.actor_opt.zero_grad()
+        policy_loss.backward()
+        self.actor_opt.step()
+
+        self.critic_opt.zero_grad()
+        critic_loss.backward() 
+        self.critic_opt.step()
+
+        # update target networks 
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+
+class TD3:
+    def __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0, p=2):
+        # Params
+        self.num_states = n_states
+        self.num_actions = n_actions
+        self.gamma = gamma
+        self.tau = tau
+
+        self.batch_size=batch_size
+
+        self.c_L1=[]
+        self.c_L2=[]
+        self.p_L=[]
+
+        self.m=0
+        self.p=p
+
+        # Networks
+        self.actor = policy(self.num_states,self.num_actions)
+        self.actor_target = policy(self.num_states,self.num_actions)
+        self.critic1 = Qfun(self.num_states, self.num_actions)
+        self.critic_target1 = Qfun(self.num_states, self.num_actions)
+        self.critic2 = Qfun(self.num_states, self.num_actions)
+        self.critic_target2 = Qfun(self.num_states, self.num_actions)
+
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target1.parameters(), self.critic1.parameters()):
+            target_param.data.copy_(param.data)
+
+        for target_param, param in zip(self.critic_target2.parameters(), self.critic2.parameters()):
+            target_param.data.copy_(param.data)
+        
+        # Training
+        self.RB = Buffer(self.num_states,self.num_actions,buffer_capacity,batch_size)        
+        self.critic_loss1  = nn.MSELoss()
+        self.critic_loss2  = nn.MSELoss()
+        self.actor_opt= torch.optim.Adam(self.actor.parameters(), lr=actor_learning_rate, weight_decay=w_decay)   #weight_decay
+        self.critic_opt1= torch.optim.Adam(self.critic1.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+        self.critic_opt2= torch.optim.Adam(self.critic2.parameters(), lr=critic_learning_rate, weight_decay=w_decay)
+
+    def get_action(self, state):
+        state = torch.tensor([state]).float()
+        action = self.actor.forward(state)
+        action = np.squeeze(action.detach().numpy())
+        # action=np.ndarray.item(action)
+        return action
+    
+    def update(self):
+        states, actions, rewards, next_states = self.RB.get_batch()
+        states = torch.FloatTensor([states]).transpose(0,1).float()
+        actions = torch.FloatTensor([actions]).transpose(0,1).float()
+        rewards = torch.FloatTensor([rewards]).transpose(0,1).float()
+        next_states = torch.FloatTensor([next_states]).transpose(0,1).float()
+    
+
+
+        # Critic loss        
+        Qvals1 = self.critic1.forward(states, actions)
+        Qvals2 = self.critic2.forward(states, actions)
+        na_= self.actor_target.forward(next_states).detach()
+        next_actions = np.clip(na_ + np.clip(np.random.normal(0,0.1,na_.size()),-.1,.1) ,-1,1).float()
+
+        next_Q1 = self.critic_target1.forward(next_states, next_actions)
+        next_Q2 = self.critic_target2.forward(next_states, next_actions)
+        next_Q=torch.min(next_Q1,next_Q2)
+
+        Qprime = rewards + self.gamma * next_Q.detach()
+        critic_loss1 = self.critic_loss1(Qvals1, Qprime)
+        self.c_L1.append(critic_loss1.detach().numpy())
+        critic_loss2 = self.critic_loss2(Qvals2, Qprime)
+        self.c_L2.append(critic_loss2.detach().numpy())
+
+        #Critic Update
+        self.critic_opt1.zero_grad()
+        critic_loss1.backward() 
+        self.critic_opt1.step()
+
+        self.critic_opt2.zero_grad()
+        critic_loss2.backward() 
+        self.critic_opt2.step()
+
+        if self.m%self.p==0:
+            # Actor loss
+            policy_loss = -self.critic1.forward(states, self.actor.forward(states)).mean()
+            self.p_L.append(policy_loss.detach().numpy())
+
+            # Actorupdate networks     
+
+            self.actor_opt.zero_grad()
+            policy_loss.backward()
+            self.actor_opt.step()
+
+            for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+       
+            for target_param, param in zip(self.critic_target1.parameters(), self.critic1.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+
+            for target_param, param in zip(self.critic_target2.parameters(), self.critic2.parameters()):
+                target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
+        
+
+        self.m+=1
+
+        # update target networks 
+ 
+
+class OUActionNoise:
+    def __init__(self, mean, sigma_max=.35, sigma_min=0, theta=0.15, dt=1, decay_period=1e4, x_initial=None):
+        self.theta = theta
+        self.mean = mean
+        self.sigma = sigma_max
+        self.max_sigma=sigma_max
+        self.min_sigma=sigma_min
+        self.dt = dt
+        self.x_initial = x_initial
+        self.decay_period=decay_period
+        self.reset()
+
+    def __call__(self,t):
+        # Formula taken from https://www.wikipedia.org/wiki/Ornstein-Uhlenbeck_process.
+        x = (
+            self.x_prev
+            + self.theta * (self.mean - self.x_prev) * self.dt
+            + self.sigma * np.sqrt(self.dt) * np.random.normal(size=self.mean.shape)
+        )
+        # Store x into x_prev
+        # Makes next noise dependent on current one
+        self.x_prev = x
+        
+        
+        self.sigma = self.max_sigma - (self.max_sigma - self.min_sigma) * min(1.0, t / self.decay_period)
+        
+        return x
+
+    def reset(self):
+        if self.x_initial is not None:
+            self.x_prev = self.x_initial
+        else:
+            self.x_prev = np.zeros_like(self.mean)
+
+class beta:
+    def __init__(self,cap,phi,scl, ds=0.99, rlb_tol=0.025, cooldown=10):
+        self.cap=cap
+        # self.tolerance=1e-4
+        # self.a=0.9
+        # self.b=0.5
+        # self.c=2
+        # self.d=0.01
+        # self.discount=0
+        # self.alpha1=0.05
+        # self.alpha2=0.01
+        self.erel=1e-3
+        self.m=0
+        self.discount=ds
+
+        self.scl=scl
+        
+        
+        self.beta=1e-3
+        # self.betaP=1e-3
+        # self.bp=np.arange(0,1.01,.01)
+        # self.tau=.01
+        
+        self.E=[]
+        self.Ep=[0.0]
+        self.Er=[0.0]
+        
+        self.Em=[0.0]
+        
+        self.rlb=[0]
+        self.pb=[]
+        
+        self.Evg=0
+        self.Ervg=0
+        self.Epvg=0
+        
+        self.Emvg=0
+        
+        # self.rlbvg=0
+        # self.pbvg=0
+            
+        # self.bb=[]
+        # self.Ebad=[]
+        # self.Eup=[]
+        # self.up=[]
+        # self.Edwn=[]
+        # self.dwn=[]
+        
+        self.phi=phi
+        
+        self.betacounter=[]
+        # self.rt=0
+        # self.pt=0
+        self.f=0
+        self.i=0
+        self.rlb_tolerance=rlb_tol
+        self.cooldown=cooldown
+        
+    def beta_update(self, sp, yk, bep):#, du_RLk_1, du_PIDk_1, du_RLk, du_PIDk):
+        
+        
+        # ynormk1=self.scla[0].norm(yk[0])
+        # spnorm1=self.scla[0].norm(sp[0])
+        # ynormk2=self.scla[1].norm(yk[1])
+        # spnorm2=self.scla[1].norm(sp[1])
+        
+        # enormk=abs(ynormk1-spnorm1)+abs(ynormk2-spnorm2)
+        
+        ynormk1=self.scl.norm(yk)
+        spnorm1=self.scl.norm(sp)
+        enormk= abs(ynormk1-spnorm1)
+        
+        # ds=0.99997
+        self.Er=[x*self.discount for x in self.Er]
+        self.Ep=[x*self.discount for x in self.Ep]
+        self.Em=[x*self.discount for x in self.Em]
+        self.Ervg=np.mean(self.Er)
+        self.Epvg=np.mean(self.Ep)
+        self.Emvg=np.mean(self.Em)
+
+        if self.m/self.cap<1:
+            self.rlb.append(bep)
+            self.pb.append(1-bep)
+            self.E.append(enormk)
+            
+        else:
+            
+            self.rlb.pop(0)
+            self.rlb.append(bep)
+            self.pb.pop(0)
+            self.pb.append(1-bep)
+            self.E.pop(0)
+            self.E.append(enormk)
+
+
+
+        if bep>0.7:
+            # if len(self.Er)>=cap:
+            if len(self.Er)>=self.cap:
+                self.Er.pop(0)
+            
+            self.Er.append(enormk)
+            
+        elif bep<0.3:
+            # if len(self.Ep)>=cap:
+            if len(self.Ep)>=self.cap:
+                self.Ep.pop(0)
+            self.Ep.append(enormk)
+            
+        elif bep<0.7 and bep>0.3:
+            if len(self.Em)>=self.cap:
+                self.Em.pop(0)
+            self.Em.append(enormk)
+            
+            
+
+        self.Evg=round(np.mean(self.E),3)
+        # Estd=np.std(self.E)
+        self.Ervg=round((self.Ervg),3)
+        self.Epvg=round((self.Epvg),3)
+        self.Evg=round(np.mean(self.E),3)
+        # Estd=np.std(self.E)
+        
+        # self.rlbvg=round(np.mean(self.rlb),3)
+        # self.pbvg=round(np.mean(self.pb),3)
+        # self.rlbvg=np.clip(self.rlbvg,1e-3,1)
+        # self.pbvg=np.clip(self.pbvg,1e-3,1)    
+        
+        
+        if self.f==0 and abs(self.rlb[-1]-self.rlb[-2])>self.rlb_tolerance:
+            self.f=1
+                
+        if self.i>=self.cooldown:
+            self.f=0
+            self.i=0            
+        
+        if self.m<self.phi or self.f==1 or (self.Emvg<self.Epvg and self.Emvg< self.Ervg and bep<0.7 and bep>0.3):
+            self.beta=self.beta
+            self.i+=1
+            self.betacounter.append(0)
+
+        elif self.Epvg>self.Ervg:
+            self.beta=self.beta + 0.1*self.beta
+            self.betacounter.append(6)
+        elif self.Epvg<=self.Ervg:
+            self.beta=self.beta - 0.1*self.beta
+            self.betacounter.append(7)
+        
+        
+        # self.beta=self.beta*(1-self.tau)+ self.tau*betanew
+        self.m+=1
+        self.beta=np.clip(self.beta,1e-3,1)
+        
+        return(self.beta)
+        
+    def reset(self, beta_IV=1e-3):
+        # self.erel=erel
+        # self.Er=erel
+        # self.Ep=erel
+        # self.m=0
+        self.beta=beta_IV
+        self.betacounter=[]
+
+class PID:
+    def __init__(self,kp,ti,de,lb,ub):
+        self.kp=kp
+        self.ti=ti
+        self.e=0
+        self.eL=0
+        self.aL=0
+        # self.sp=sp
+        self.lb=lb
+        self.ub=ub
+        
+        self.de=de
+        
+    def action(self, y, sp):
+        self.eL=self.e
+        self.e=self.de*(sp-y)    #stable system
+        # self.e=-(sp-y)  #unstable model  ################################################################
+        
+        a=self.aL+self.kp*self.e - self.kp*self.eL + (self.kp/self.ti)*self.e
+        dA=a-self.aL
+        self.aL=a
+        return a,dA
+    
+    # def action(self, y):
+    #     self.eL=self.e
+    #     self.e=self.de*(y-self.sp)    #stable system
+    
+        
+    #     a=self.aL+self.kp*self.e - self.kp*self.eL + self.ki*self.e
+    #     dA=a-self.aL
+    #     self.aL=a
+    #     return a,dA
+    
+    def aw_action(self, y,sp):
+        self.eL=self.e
+        self.e=self.de*(sp-y)
+        a=np.clip(self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e,
+                  self.lb,self.ub)
+        if a==self.lb or a==self.ub:
+            self.e=0
+        dA=a-self.aL
+        self.aL=a
+        return a,dA    
+    def awref_action(self, y,sp, uref):
+        self.eL=self.e
+        self.e=self.de*(sp-y)
+        asub=self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+        a=np.clip(asub+uref,self.lb,self.ub)
+        if a==self.lb or a==self.ub:
+            asub2=self.aL+self.kp*self.e - self.kp*self.eL
+        else:
+            asub2=asub
+        a2=np.clip(asub2+uref,self.lb,self.ub)
+        dA=a2-self.aL
+        self.aL=asub2
+        return a2,dA    
+    def ref_action(self, y,sp, uref):
+        self.eL=self.e
+        self.e=self.de*(sp-y)
+        asub=self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+        a=np.clip(asub+uref,self.lb,self.ub)
+        # if a==self.lb or a==self.ub:
+        #     self.e=0
+        dA=a-self.aL
+        self.aL=asub
+        return a,dA    
+        
+             
+    def reset(self):
+        self.e=0
+        self.eL=0
+        self.aL=0
+
+
+
+class PID_n:
+    def __init__(self,kp,ti,de,lb,ub,ainit=0):
+        self.kp=kp
+        self.ti=ti
+        self.e=0
+        self.eL=0
+        self.aL=0
+        self.aLact=ainit
+        # self.sp=sp
+        self.lb=lb
+        self.ub=ub
+        
+        self.de=de
+        
+        self.cat=[]
+        
+
+    # def action(self, y, sp):
+    #     self.eL=self.e
+    #     self.e=self.de*(sp-y)    #stable system
+    #     # self.e=-(sp-y)  #unstable model  ################################################################
+        
+    #     a=self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+    #     dA=a-self.aL
+    #     self.aL=a
+    #     return a,dA
+    # def aw_action(self, y,sp):
+        # self.eL=self.e
+        # self.e=self.de*(sp-y)
+        # a=np.clip(self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e,
+        #           self.lb,self.ub)
+        # if a==self.lb or a==self.ub:
+        #     self.e=0
+        # dA=a-self.aL
+        # self.aL=a
+        # return a,dA    
+
+    def awref_action(self, y,sp, uref, alast=None):
+        if alast!=None:
+            self.aLact=alast
+        self.eL=self.e
+        self.e=self.de*(sp-y)
+        asub=self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+        a=np.clip(asub+uref,self.lb,self.ub)
+        if a==self.lb or a==self.ub:
+            asub2=self.aL+self.kp*self.e - self.kp*self.eL
+            # asub2=self.aLact+self.kp*self.e - self.kp*self.eL  #first change
+        else:
+            asub2=asub
+        a2=np.clip(asub2+uref,self.lb,self.ub)
+        dA=a2-self.aLact
+        # self.aLact=a2
+        self.aL=asub2
+
+        self.cat.append([self.eL, self.e, asub, a, asub2, a2, dA, self.aLact])
+                
+        # self.aL=asub2 #Before
+        return a2,dA    
+    
+    # def action2(self,y,sp,uref,alast=None):
+    #     if alast!=None:
+    #         self.aLact=alast
+    #     self.eL=self.e
+    #     self.e=self.de*(sp-y)
+    #     da=self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+    #     a=np.clip(da+uref+self.aLact,self.lb,self.ub)
+    #     if a==self.lb or a==self.ub:
+    #         a=np.clip(a-self.kp/self.ti*self.e,self.lb,self.ub)
+
+    # def ref_action(self, y,sp, uref):
+    #     self.eL=self.e
+    #     self.e=self.de*(sp-y)
+    #     asub=self.aL+self.kp*self.e - self.kp*self.eL + self.kp/self.ti*self.e
+    #     a=np.clip(asub+uref,self.lb,self.ub)
+    #     # if a==self.lb or a==self.ub:
+    #     #     self.e=0
+    #     dA=a-self.aL
+    #     self.aL=asub
+    #     return a,dA    
+        
+             
+    def reset(self):
+        self.e=0
+        self.eL=0
+        self.aL=0
+
+# def expand(x):
+#     # [1, x, x^2, x^3, x^4]
+#     xx=np.concatenate((np.ones((1,x.size)),
+#                         x,
+#                         np.multiply(x,x),
+#                         np.multiply(x,np.multiply(x,x)),
+#                         np.multiply(np.multiply(x,x),np.multiply(x,x)),                 
+#     ),0)
+#     return xx
+# def expand_linear(x):
+#     # [1, x, x^2, x^3, x^4]
+#     xx=np.concatenate((np.ones((1,x.size)),
+#                         x),0)
+#     return xx
+# def regress(x,y):
+#     W=np.dot(np.linalg.inv(np.dot(x,x.T)),np.dot(x,y.T))
+#     return W
+
+# def grad(w, x):
+#     dx=np.array([[0, 1, 2*x, 3*x**2, 4*x**3 ]]).T
+#     G=np.dot(w.T,dx).tolist()[0]
+#     return G
+# # (1,100)
+
+# # tst=np.array([[-1, .5, 60],[-.1, .5, 59],[-.1, .5, 58],[-.1, .5, 0]])
+# # # tst[:,-1]
+# # for i,j in enumerate(tst[:,-1]):
+# #     # print(i)
+# #     # print(j)
+# #     if j==0:
+# #         tst=np.delete(tst,i,0)
+# # print(tst)        
+# # np.append(tst,np.array([[1,1,1]]),0)
+# # tst[tst[:,1]<0.6][:,0].mean()
+# # tst[:,0:1]=tst[:,0:1]*.99
+# # tst[:,-1:]=tst[:,-1:]-1
+# # if tst[0.2>tst[:,1]][:,1].size>=3:
+# #     tst=np.delete(tst,np.where(0.2>tst[:,1])[0][0],0)
+
+
+
+# %% NEW BETA
+
+def expand(x):
+    # [1, x, x^2, x^3, x^4]
+    xx=np.concatenate((np.ones((1,x.size)),
+                        x,
+                        np.multiply(x,x),
+                        # np.multiply(x,np.multiply(x,x)),
+                        # np.multiply(np.multiply(x,x),np.multiply(x,x)),                 
+    ),0)
+    return xx
+def grad(w, x):
+    dx=np.array([[0,
+                    1,
+                    2*x,
+                    # 3*x**2,
+                    # 4*x**3
+                    ]]).T
+        
+    # dx=np.array([[0, 1, 2*x, 3*x**2, 4*x**3 ]]).T
+    G=np.dot(w.T,dx).tolist()[0]
+    return G
+
+def expand_linear(x):
+    # [1, x, x^2, x^3, x^4]
+    xx=np.concatenate((np.ones((1,x.size)),
+                        x,
+                        # np.multiply(x,x)
+                        ),0)
+    
+    # xx=np.concatenate((np.ones((1,x.size)),
+    #                         x),0)
+    return xx
+def grad_L(w, x):
+    dx=np.array([[0,
+                    1,
+                    # 2*x,
+                    # 3*x**2,
+                    # 4*x**3
+                    ]]).T
+        
+    # dx=np.array([[0, 1, 2*x, 3*x**2, 4*x**3 ]]).T
+    G=np.dot(w.T,dx).tolist()[0]
+    return G
+
+
+def regress(x,y):
+    W=np.dot(np.linalg.inv(np.dot(x,x.T)),np.dot(x,y.T))
+    return W
+
+# (1,100)
+
+class beta4:
+    def __init__(self, scls, betastart=0, cap=60, capL=60, phi=60, phi2=60, Timer=60, TimerL=300, ds=1, step=0.02, rlb_tol=0.025, cooldown=1, baseerror=0.02, bounds=[0.3,0.7]):
+        self.clock=[]
+        self.b0=betastart
+        self.lb=bounds[0]
+        self.ub=bounds[1]
+        self.beta=betastart
+        self.m=0
+        self.BE=baseerror
+
+        self.scls=scls      
+        
+        # self.cat=np.array([[0.02, 1, 300]])
+        self.cat=np.array([[0, 0, 1]])
+        self.catL=np.array([[0, 0, 1]])
+
+        self.rlb=[betastart]
+        self.Gcat=[]
+        self.Wcat=[]
+        self.Mcat=[]
+        self.Mwcat=[]
+
+        self.Mpcat=[]
+        self.Mpwcat=[]
+
+        self.Ervg=0
+        self.Epvg=0
+        self.Emvg=0
+        
+        # Buffer capactity
+        self.cap=cap
+        self.capL=capL
+        self.discount=ds
+        self.time=Timer
+        self.timeL=TimerL
+
+        # sufficient learning parameter
+        self.phi=phi
+        self.phi2=phi2
+        
+        # catalog
+        self.betacounter=[]
+        self.lookback=[]
+       
+    #    Cooldown stuff
+        self.f=0
+        self.i=0
+        self.rlb_tolerance=rlb_tol
+        self.step=step
+        self.cooldown=cooldown
+        
+    def beta_update(self, sp, yk, bep):
+        
+        
+        ynormk1=self.scls.norm(yk)
+        spnorm1=self.scls.norm(sp)
+        # ynormk2=self.scls[1].norm(yk[1])
+        # spnorm2=self.scls[1].norm(sp[1])
+        
+        enormk=abs(ynormk1-spnorm1)
+        # enormk=abs(ynormk1-spnorm1)+abs(ynormk2-spnorm2)
+
+        self.cat[:,-1:]=self.cat[:,-1:]-1
+        self.catL[:,-1:]=self.catL[:,-1:]-1
+        self.cat=np.append(self.cat,np.array([[enormk, bep, self.time]]),0)
+        self.catL=np.append(self.catL,np.array([[enormk, bep, self.timeL]]),0)
+
+        subs=[]
+        for i,j in enumerate(self.cat[:,-1]):
+            if j<=0:
+                subs.append(i)
+        for i in reversed(subs):
+            self.cat=np.delete(self.cat,i,0)
+
+        subs=[]
+        for i,j in enumerate(self.catL[:,-1]):
+            if j<=0:
+                subs.append(i)
+        for i in reversed(subs):
+            self.catL=np.delete(self.catL,i,0)
+        
+        if self.cat[self.cat[:,1]<=self.lb][:,1].size>=self.cap:
+            self.cat=np.delete(self.cat,np.where(self.lb>=self.cat[:,1])[0][0],0)
+        if self.cat[self.cat[:,1]>=self.ub][:,1].size>=self.cap:
+            self.cat=np.delete(self.cat,np.where(self.ub<=self.cat[:,1])[0][0],0)
+        if self.cat[(self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub) ][:,1].size>=self.cap:
+            self.cat=np.delete(self.cat,np.where((self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub))[0][0],0)
+
+        if self.catL[self.catL[:,1]<=self.lb][:,1].size>=self.capL:
+            self.catL=np.delete(self.catL,np.where(self.lb>=self.catL[:,1])[0][0],0)
+        if self.catL[self.catL[:,1]>=self.ub][:,1].size>=self.capL:
+            self.catL=np.delete(self.catL,np.where(self.ub<=self.catL[:,1])[0][0],0)
+        if self.catL[(self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub) ][:,1].size>=self.capL:
+            self.catL=np.delete(self.catL,np.where((self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub))[0][0],0)
+        
+        # print(self.catL[self.catL[:,1]>=self.ub])
+
+        # self.cat[:,0:1]=self.cat[:,0:1]*self.discount
+        # self.catL[:,0:1]=self.catL[:,0:1]*self.discount
+        if self.Ervg>self.BE:
+            self.catL[:,0:1]=np.where(self.catL[:,1:2]>=self.ub, self.catL[:,0:1]*self.discount,self.catL[:,0:1])  
+        if self.Epvg>self.BE:
+            self.catL[:,0:1]=np.where(self.catL[:,1:2]<=self.lb, self.catL[:,0:1]*self.discount,self.catL[:,0:1])  
+        if self.Emvg>self.BE:
+            self.catL[:,0:1]=np.where((self.lb<self.catL[:,1:2]) & (self.catL[:,1:2]<self.ub),self.catL[:,0:1]*self.discount,self.catL[:,0:1])
+        
+        self.Ervg=self.catL[self.catL[:,1]>=self.ub][:,0].mean()
+        self.Epvg=self.catL[self.catL[:,1]<=self.lb][:,0].mean()
+        self.Emvg=self.catL[(self.lb<self.catL[:,1]) & (self.catL[:,1]<self.ub) ][:,0].mean()
+        if np.isnan(self.Ervg):
+            self.Ervg=self.BE
+            self.catL=np.append(self.catL,np.array([[self.BE, self.ub+(1.0-self.ub)/2, 1]]),0)
+        if np.isnan(self.Epvg):
+            self.Epvg=self.BE
+            self.catL=np.append(self.catL,np.array([[self.BE, 0.0+(self.lb-0.0)/2, 1]]),0)
+        if np.isnan(self.Emvg):
+            self.Emvg=self.BE
+            self.catL=np.append(self.catL,np.array([[self.BE, self.lb+(self.ub-self.lb)/2, 1]]),0)
+       
+        if len(self.cat[self.cat[:,1]>=self.ub][:,0])==0:
+            self.cat=np.append(self.cat,np.array([[self.Ervg, self.ub+(1.0-self.ub)/2, 1]]),0)
+        if len(self.cat[self.cat[:,1]<=self.lb][:,0])==0:    
+            self.cat=np.append(self.cat,np.array([[self.Epvg, 0.0+(self.lb-0.0)/2, 1]]),0)
+        if len(self.cat[(self.lb<self.cat[:,1]) & (self.cat[:,1]<self.ub) ][:,0])==0:
+            self.cat=np.append(self.cat,np.array([[self.Emvg, self.lb+(self.ub-self.lb)/2, 1]]),0)
+      
+        xx=expand(self.cat[:,1:2].T)
+        avg=np.array([[ self.Epvg, 0.0+(self.lb-0.0)/2],
+                        [ self.Ervg, self.ub+(1.0-self.ub)/2],
+                        [self.Emvg, self.lb+(self.ub-self.lb)/2]])
+        
+        # avg=np.array([[ self.Epvg, 0.0+(self.lb-0.0)/2],
+        #                 [ self.Ervg, self.ub+(1.0-self.ub)/2]])
+        
+        xxL=expand_linear(avg[:,1:2].T)
+        ML=regress(xxL,avg[:,0:1].T)
+        M=grad_L(ML,bep)[0]
+
+        xxP=expand(self.catL[:,1:2].T)
+        # xxP=expand(avg[:,1:2].T)
+        MP=regress(xxP,self.catL[:,0:1].T)
+        M_p=grad(MP,bep)[0]
+
+        self.Mwcat.append(ML.T.tolist())
+        self.Mcat.append(M)
+
+        self.Mpwcat.append(MP.T.tolist())
+        self.Mpcat.append(M_p)
+
+
+
+        try:
+            W=regress(xx,self.cat[:,0:1].T)
+            G=grad(W,bep)[0]
+            self.Gcat.append(G)
+            self.Wcat.append(W.T.tolist())
+            self.GRADon=0.5
+            self.clock.append(self.m)
+        except:
+            self.GRADon=0
+            print('failedRG')
+            # self.betacounter.append(999)
+        
+        
+        alpha=1
+        if self.GRADon==0.5:
+            
+            if ((M_p>0 and G>0) or (M_p<0 and G<0) or (W[-1]/MP[-1]>0)) or abs(M)<1e-6:              
+                for i in range(10):
+                    P=np.clip(self.beta-G*alpha,0,1)
+                    J=np.dot(W.T,expand(np.array([[P]])))
+                    J2=np.dot(W.T,expand(np.array([[bep]])))
+                    if J2-J>1e-6: #and J>=0:
+                        self.GRADon=1
+                        print('short Grad descent')
+                        break
+                        
+                    elif i==range(10)[-1]:
+                        alpha=1
+                        for s in range(10):
+                            P=np.clip(self.beta-M_p*alpha,0,1)
+                            J=np.dot(MP.T,expand(np.array([[P]])))
+                            J2=np.dot(MP.T,expand(np.array([[bep]])))
+                            if J2-J>1e-6: #and J>=0:
+                                self.GRADon=1
+                                print('long Grad descent')
+                                break
+                            elif s==range(10)[-1]:
+                                self.GRADon=0
+                                print('failedLS')
+                            else:
+                                alpha=alpha*0.5
+        
+                    else:
+                        alpha=alpha*0.5
+            else:
+                self.GRADon=0
+                
+                print('slope disagree')
+    
+        
+
+        # if self.GRADon==0.5:
+        #     xtest=np.array([np.linspace(0,1,100)])
+        #     xxtest=expand(xtest)
+        #     ytest=np.dot(W.T,xxtest)
+        #     P=xtest[:,np.argmin(ytest[-1])].item()
+        #     self.GRADon=1
+
+        self.rlb.append(bep)
+
+
+        self.lookback.append([self.Epvg,self.Emvg,self.Ervg,self.m])
+        self.Ervg=round((self.Ervg),3)
+        self.Epvg=round((self.Epvg),3)
+        self.Emvg=round((self.Emvg),3)
+
+
+
+        if self.f==0 and abs(self.rlb[-1]-self.rlb[-2])>self.rlb_tolerance:
+            self.f=1
+                
+        if self.i>=self.cooldown:
+            self.f=0
+            self.i=0            
+        
+        if self.f==1 or self.m<self.phi:
+            self.beta=self.beta
+            if self.f==1:
+                self.i+=1
+            self.betacounter.append(0)
+
+        
+
+        elif self.m<self.phi2 or self.GRADon==0:
+            if alpha<1 and abs(M_p)<0.01 :
+                self.beta=self.beta
+                print('local min')
+            else:
+                P=np.clip(self.beta-M*1,0,1)
+                self.beta=P.item()
+                self.betacounter.append(1)
+                print('Default M')
+
+            # if self.Emvg<self.Epvg and self.Emvg< self.Ervg and bep<self.ub and bep>self.lb:   #Swap
+            #     self.beta=self.beta
+            #     # self.betacounter.append(1)
+            #     if self.GRADon==0:
+            #         self.betacounter.append(11)
+            #     else:
+            #         self.betacounter.append(1)
+            # elif self.Epvg>self.Ervg:
+            #     self.beta=self.beta + self.step # 0.1*self.beta
+            #     # self.betacounter.append(2)
+            #     if self.GRADon==0:
+            #         self.betacounter.append(22)
+            #     else:
+            #         self.betacounter.append(2)
+            # elif self.Epvg<=self.Ervg:
+            #     self.beta=self.beta - self.step #0.1*self.beta
+            #     # self.betacounter.append(3)
+            #     if self.GRADon==0:
+            #         self.betacounter.append(33)
+            #     else:
+            #         self.betacounter.append(3)
+        
+        elif self.GRADon==1:
+            # if P>self.ub:
+            #     self.beta=P.item()*1.1
+            # elif P<self.lb:
+            #     self.beta=P.item()*.9
+            # else:
+            #     self.beta=P.item()
+
+            # if abs(G)>1e-6:
+            #     self.beta=P.item()
+            #     print('gradient descent')
+            # else:
+            #     self.beta=self.beta
+            #     print('small grad')
+
+            self.beta=P.item()
+            print('gradient descent')
+
+            # self.beta=self.beta-G *.01  
+            self.betacounter.append(4)
+
+        # self.beta=self.beta*(1-self.tau)+ self.tau*betanew
+        self.m+=1
+        self.beta=np.clip(self.beta,0,1)
+        
+        return(self.beta)
+        
+    def reset(self):
+        
+        self.beta=self.b0
+        self.betacounter=[]
+
+
+
+
+# %% CSTR model functions
+def cstr_align():
+    Catemp=m.Cas[:]()
+    Cbtemp=m.Cb[:]()
+    Tstemp=m.Ts[:]()
+
+    m.Cas[0].fix(Catemp[-1])
+    m.Cb[0].fix(Cbtemp[-1])
+    m.Ts[0].fix(Tstemp[-1])
+
+# m.T0[t].fix()
+# T0in=378.05
+
+def cstr_out():
+    Cbtemp=m.Cb[:]()
+    Cb=Cbtemp[-1]
+    y=Cb-Cbs0
+    Q=m.Qk[0]
+    return y,Q,Cb
+
+def cstr_fun(Q,da,sp):
+    Qnew=Q+da
+    m.Qk[:]=Qnew
+    Solver.solve(m, tee=False)
+    y=cstr_out()[0]
+    rsub=abs(scls.norm(y)-scls.norm(sp))
+    reward=-rsub
+    # reward=-rsub.transpose()@rsub
+    
+    return reward,y,Qnew
+
+def cstr_init():
+ #Initial Conditions
+     Cas0 = 2480.34
+     Cbs0 = 1066.65
+     Ts0 = 382.49
+
+ #Initization reactor states
+     m.Cas[0].fix(Cas0)
+     m.Cb[0].fix(Cbs0)
+     m.Ts[0].fix(Ts0)
+ 
+     for t in m.T:
+         m.Vdot[t] = 0.1419
+         m.Qk[t] = -2811.9
+         m.Ca0[t] = 5100
+         m.T0[t] = 378.05
+         
+         m.Vdot[t].fix()
+         m.Qk[t].fix()
+         m.Ca0[t].fix()
+         m.T0[t].fix()
+ 
+     y=Cas0-Cas0
+     Q=-2811.9
+     return y, Q
+
+
+
+# %%  Sclaing
+ub=30*3
+lb=-30*3
+aub=300
+alb=-300
+
+scla=scale_fun_sig(alb,aub)
+scls=scale_fun_sig(lb,ub)
+
+
+kp=1  #asymptoically stable system
+ki=20
+ti=kp/ki
+de=1
+
+# pid1=PID(kp,ti,de,alb,aub)
+pid1=PID_n(kp,ti,de,-1e6,1e6)
+
+
+# %% Loop[ Functions]
+
+def sigmoid(first,second,eps):
+    out=np.exp((first-second)/eps)/(1+np.exp((first-second)/eps))
+    if math.isnan(out):
+        out=1
+    return out
+
+# def ret():
+#      error=scsp.norm(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value) - scsp.norm(o_sp)
+#      duty_diff=sc.norm(abs(m.fs.sweep_heater.electric_heat_duty[m.fs.time.last()].value-finala))
+#      abs_error=-abs(error)*(duty_diff+1)
+#      return abs_error
+
+def ret(enorm):
+    # error1=sc_out[0].norm(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value)-sc_out[0].norm(o_sp_f)
+    # error2=sc_out[1].norm(m.fs.soc_module.oxygen_outlet.temperature[m.fs.time.last()].value)-sc_out[1].norm(o_sp_s)
+    #  error=scsp.norm(m.fs.soc_module.fuel_outlet.temperature[m.fs.time.last()].value) - scsp.norm(o_sp)
+
+
+    dist=np.sqrt(enorm**2)
+    bound=sigmoid(radius,dist,1e-3)
+    # -((1-bound)+bound*(dist/0.1))
+
+    abs_error=-abs(enorm)
+    # abs_error=-(enorm**2)*10
+    # abs_error=-(error1**2 + error2**2)*100
+    # abs_error=-(error1**2 + error2**2) + -((1-bound)+bound*(dist/radius))
+    return abs_error
+
+def decide(bep,pida,rla):
+    actual=bep*rla+(1-bep)*pida
+    return actual
+
+
+# %% DDPG
+sp=0
+
+
+wd=0
+bs=128
+n_states=1
+n_actions=1
+# s1=sarsa()
+Agent=DDPGagent(n_states,n_actions, 1e-4, 1e-3, 0.99, 1e-1, 100000, bs, wd)
+# Agent=TD3(n_states,n_actions, 1e-4, 1e-3, 0.99, 1e-2, 100000, bs, wd, 2)
+
+
+#  __init__(self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):
+
+# trad trained TD3
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic_target2')
+
+# new beta function; 121223; 1000 episodes;
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic_target2')
+
+
+# RL trad; offset G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic_target2')
+
+
+# new beta good PID;G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic_target2')
+
+
+# Agent.actor= torch.load(path_a)
+# Agent.actor_target= torch.load(path_at)
+# Agent.critic1= torch.load(path_c1)
+# Agent.critic_target1= torch.load(path_ct1)
+# Agent.critic2= torch.load(path_c2)
+# Agent.critic_target2= torch.load(path_ct2)
+
+
+# %% Settings
+radius=0.05
+sp=0
+
+# tend=420 #############################################################
+tend=30
+
+cap=60
+phi=30*10
+# B=beta(cap,phi,scls,ds=0.99,rlb_tol=0.025, cooldown=1)  #cooldown=10
+
+
+# B=beta4(scls, betastart=0, cap=10, capL=60, phi=0, phi2=0, Timer=10, TimerL=1e3,
+#          ds=0.999, step=0.2, rlb_tol=0.333, cooldown=1, baseerror=.015, bounds=[0.3,0.7])
+
+B=beta4(scls, betastart=0, cap=20, capL=90, phi=0, phi2=0, Timer=10, TimerL=1e3,
+         ds=0.999, step=0.2, rlb_tol=0.333, cooldown=1, baseerror=.015, bounds=[0.3,0.7])
+
+# BE=.008 or BE=.015
+
+
+pid1.reset()
+
+# epmax=500
+epmax=10
+
+#####################################################################################
+# OUA=OUActionNoise(np.array(0),sigma_max=0.15, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmax)
+OUA=OUActionNoise(np.array(0),sigma_max=0.3, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmax)
+# OUA=OUActionNoise(np.array(0),sigma_max=0.0, sigma_min=0.0, theta=0.15, dt=1, decay_period=epmax)
+# pid=PID(10,10,1,-1e6,1e6)
+
+
+Bridge=0 #1=turn on PID-RL bridge (beta updates)
+BetaStart=1 #1=PID 0=RL starting Beta
+
+Tdist_on=1   #Random dist
+spTdist_on=0   #specific range random other
+spT_test=0   #twsr result
+
+tol=1e-4
+
+# pid1.ti=pid1.ti*50   #midpPidP
+# pid1.ti=1e6     #bad PIDP
+
+# pid1.ki=pid1.ki/6   #midpid
+# pid1.ki=0     #bad PID
+
+# sc=scale_fun(-amag,amag,lb,ub)
+# sc=scale_fun(alb,aub,lb,ub)
+
+# %% Loop
+
+
+OF=[]
+DF=[]
+reps=[]
+seps=[]
+beps=[]
+neps=[]
+BC=[]
+
+ycont=[]
+acont=[]
+danormcon=[]
+danormcon2=[]
+danormcon3=[]
+danormcon4=[]
+
+y,Q=cstr_init()
+Q0=Q
+resets=0
+
+bigycap=30*100
+bigy=[]
+bigy.append(y)
+spp=[]
+
+distcat=[]
+
+distcat_sp=[379.2691705580665,
+            379.8827872688405,
+            377.8984466877722,
+            376.3039976803495,
+            379.51483732145084,
+            377.092030851864,
+            377.9901111802617,
+            379.91866325321234,
+            377.06147543153276,
+            376.54582885986287]
+
+# sp=0
+# %% Loop2
+startT=time.time()
+lts=time.time()
+
+Bcatlong=[]
+ecatlong=[]
+
+TsDist=378.05
+# LA=0
+for ep in range(epmax):
+                    ########################################RL-PID control#############################################
+    
+    # if ep==round(epmax/3):
+    #     sp=10
+    # elif ep==round(epmax/3*2):
+    # #     sp=-10
+    # if ep==round(epmax/2):
+    #     pid1.ki=0
+    # if ep==round(epmax/2):
+    #     # pid1.sp=40*ep/epmax
+        # sp=20
+    # pid1.sp=40*ep/epmax
+    
+    print('---------------')
+    LDT=(time.time()-lts)/60
+    print('LOOP TIME:',LDT,'min --------------------------------')
+    lts=time.time()
+    print(ep/epmax*100)
+    
+    ecat=[]
+    ycat=[]
+    rcat=[]
+    dacat=[]
+    acat=[]
+    Bcat=[]
+    ncat=[]
+    Tcat=[]
+    pp=0
+    
+    if Tdist_on==1:
+        TsDist=378.05+rand.choice([-2,2])*rand.rand()
+    elif spTdist_on==1:
+        if any([ep==j for j in range(epmax)[20:30]]):
+            TsDist=distcat_sp[np.where(np.array(range(epmax))[20:30]==ep)[0][0]]
+            print(TsDist)
+        elif any([ep==j for j in range(epmax)[-11:-1]]):
+            TsDist=distcat_sp[np.where(np.array(range(epmax))[-11:-1]==ep)[0][0]]
+            print(TsDist)
+        else:
+            TsDist=378.05+rand.choice([-2,2])*rand.rand()
+    elif spT_test==1:
+        TsDist=distcat_sp[ep]
+    distcat.append(TsDist)
+    m.T0[:]=TsDist
+    
+    Btempold=B.beta
+    daRLold=0
+    daPIDold=0
+    for s in range(tend):
+        
+        print('---------------')
+        print(s/tend*100)
+
+        if s== 60:
+            TsDist=378.05+2
+            m.T0[:]=TsDist
+        elif s==240:
+            TsDist=378.05-2
+            m.T0[:]=TsDist
+
+        # if s== 60:
+        #       sp=-10
+        #       pid1.sp=-10
+        # elif s==240:
+        #       sp=10
+        #       pid1.sp=10
+        
+        spp.append(sp)
+        Tcat.append(TsDist)
+        
+        
+        if BetaStart==1:
+            Btemp=B.beta
+        else:
+            Btemp=1
+            
+        Bcat.append(Btemp)
+        Bcatlong.append(Btemp)
+        
+        # y=sys.y
+                    #Deviation output and full Q
+        
+        ynorm=scls.norm(y)
+        spnorm=scls.norm(sp)
+
+        enorm=ynorm-spnorm
+        # ac=sys.u
+        ycat.append(y)
+        ycont.append(y)
+
+        daRL_norm=Agent.get_action(enorm)
+        daRL=scla.act(daRL_norm)        #Derives RL action for Beta
+        actionfull, daPID=pid1.awref_action(y,sp, Q0, Q)
+        # actionfull, daPID=pid1.action(y,sp)
+# (self, y,sp, uref, alast=None):
+
+        danormcon.append(daRL)
+        danormcon2.append(daPID)
+
+        aF=decide(Btemp,daPID,daRL)                 #Outputs a combo of RL and PID
+        danormcon3.append(aF)
+        noise=OUA(ep)                        #Creates noise from Ornstein-Uhlenbock Process
+        aFnorm=scla.norm(aF)               #Scales combo action
+        if ep==epmax-1 or any([ep==j for j in range(epmax)[20:30]]) or any([ep==j for j in range(epmax)[-11:-1]]):                     #Removes noise for final output
+            noise=0
+        aFnorm_OU=aFnorm+noise              #Adds noise to scaled combo action
+        ncat.append(noise)
+        
+        # RaFnorm_OU=find_nearest(s1.ad,aFnorm_OU)  #Finds nearest discretization for combo action-noise
+        RaF_OU=scla.act(aFnorm_OU)    # Unscales action for input into function
+        danormcon4.append(RaF_OU)
+
+
+        ecat.append(enorm)
+        ecatlong.append(enorm)
+        dacat.append(RaF_OU)
+        
+        # reward, x, yplus=sys.fun(RaF_OU)
+        reward, yplus,Qnew =cstr_fun(Q,RaF_OU,sp) ######################################################
+        
+        acont.append(Qnew)
+        acat.append(Qnew)
+        rcat.append(reward)
+        
+        
+        # aFplus,daPIDplus=decide(sp,yplus,Btemp)
+        # aFplus_norm=sc.A_scale(aFplus)
+        yplus_norm=scls.norm(yplus)
+        enormplus=yplus_norm-spnorm
+        
+        # daRLplus_norm=find_nearest(s1.ad,aFplus_norm)
+        # daRLplus_norm =s1.policy(yplus_norm)   ###Q-Learn Policy
+        
+        EE=ret(enormplus)
+        
+        # s1.update(enorm,RaFnorm_OU,reward,enormplus,daRLplus_norm)  ####PID policy
+        
+        p=([enorm],[aFnorm_OU],[EE],[enormplus])
+        Agent.RB.record(p)
+        Agent.update()
+
+        Q=Qnew
+        
+        cstr_align()
+        
+        
+        if Bridge==1:
+            B.beta_update(sp, yplus, Btemp)
+            daRLold=daRL
+            daPIDold=daPID
+            Btempold=Btemp
+            
+        
+        # if  (yplus-y)*(yplus-y)<tol:  #yplus**2<tol and
+        #     break
+        if np.any(yplus>ub) or np.any(yplus<lb):
+            y, Q=cstr_init()       
+            bigy=[]
+            bigy.append(y)
+            pid1.reset()
+            resets+=1
+            break
+        
+        y=yplus
+        
+        if len(bigy) >= bigycap:
+            bigy.append(y)
+            bigy.pop(0)
+        else:
+            bigy.append(y)
+            
+        
+    BCtemp=B.betacounter
+    BC.append(BCtemp)
+    # OF.append(np.max(s1.w)) 
+    # DF.append(np.min(s1.w)) 
+    neps.append(ncat)
+    bavg=np.mean(Bcat)
+    beps.append(bavg)
+    ycat.append(yplus)
+
+    # ycont.append(yplus)
+
+    ravg=np.mean(rcat)
+    reps.append(ravg)
+    seps.append(s)
+
+    
+    
+    # B.reset(B.beta)
+
+# %%
+endT=time.time()
+FinalTime=(endT-startT)/60
+print(FinalTime, 'min')
+print(FinalTime/60, 'hr')
+
+# %% Sort Plot
+
+# pid600=load('pid600.npy')
+# badpid600=load('badpid600.npy')
+# rl600=load('rl600.npy')
+# nv4600=load('nv4600.npy')
+p=150
+MovingR=[]
+countR=0
+for x in range(len(reps)):
+    if x<p:
+        temp=np.mean(reps[0:x+1])
+    else:
+        temp=np.mean(reps[x-p:x+1])
+    MovingR.append(temp)
+    
+    
+MovingB=[]
+countB=0
+for x in range(len(beps)):
+    if x<p:
+        temp=np.mean(beps[0:x+1])
+    else:
+        temp=np.mean(beps[x-p:x+1])
+    MovingB.append(temp)
+
+# %%
+
+# plt.figure()
+# plt.plot(dacat)
+# plt.title('da final EP')
+
+# plt.figure()
+# plt.plot(acat)
+# plt.title('a final EP')
+
+# plt.figure()
+# plt.plot(ycat)
+# plt.title('y final EP')
+
+# plt.figure()
+# plt.plot(seps)
+# plt.title('AVG ep Length')
+
+# plt.figure()
+# plt.plot(reps)
+# plt.plot(MovingR)
+# plt.title('AVG R')
+
+
+# # actonset=s1.ad
+# # weights=s1.w
+
+
+# plt.figure()
+# plt.plot(beps)
+# plt.plot(MovingB)
+# plt.title('Beta')
+# plt.figure()
+# plt.plot(Bcat)
+# plt.title('Bcat')
+# # plt.figure()
+# # plt.plot(neps[3000])
+# # plt.title('noise')
+
+# # print(BCount)
+# plt.figure()
+# plt.plot(bigy)
+# plt.title('Big Y max 10 ep')
+
+
+# print(resets, 'resets')
+# # print(np.max(OF))
+# # print(np.min(DF))
+# print('final y:',ycat[-1])
+
+# %% 
+
+closs=Agent.c_L
+# closs=Agent.c_L1
+# closs2=Agent.c_L2
+ploss=Agent.p_L
+
+# %% New Plot
+plt.figure()
+plt.plot(ycont)
+plt.plot(spp,linestyle=':')
+plt.title('continuous state')
+plt.figure()
+plt.plot(acont)
+plt.title('continuous action')
+
+# plt.figure()
+# plt.plot(danormcon[-30*10:-1])
+# plt.title('dA norm for RL ')
+# plt.figure()
+# plt.plot(danormcon)
+# plt.title('dA norm for RL ')
+
+
+plt.figure()
+plt.plot(closs)
+plt.title('closs')
+plt.figure()
+plt.plot(ploss)
+plt.title('ploss')
+
+# plt.figure()
+# plt.plot(closs2)
+# plt.title('closs2')
+plt.figure()
+plt.plot(danormcon, label='RL')
+plt.plot(danormcon2, label='PID')
+plt.plot(danormcon3, label='act')
+plt.plot(danormcon4, label='act w Noise')
+plt.legend()
+plt.title('dA actions')
+
+plt.figure()
+plt.plot(Bcat)
+plt.title('beta')
+
+
+# Eintegral=[np.sum(np.abs(ecatlong[0:i])) for i,j in enumerate(ecatlong)]
+plt.figure()
+plt.plot(ecatlong)
+# plt.plot(Eintegral)
+plt.title('Error')
+
+
+plt.figure()
+plt.plot(ycont[-10*tend:])
+plt.plot(spp[-10*tend:],linestyle=':')
+plt.title('continuous state')
+plt.figure()
+plt.plot(acont[-10*tend:])
+plt.title('continuous action')
+
+# %% BCAT PLOT
+x=np.array([np.linspace(0,1,100)])
+xx=expand(x)
+y=[]
+plt.figure()
+plt.title('G')
+for i in B.Wcat[:]:
+    y.append(np.dot(np.array(i),xx))
+    
+    plt.plot(x.T,y[-1].T)
+    # plt.plot(B.catL[:,1],B.catL[:,0],linestyle='None',marker='.')
+    # plt.ylim([-0.5, 1])
+
+xxL=expand_linear(x)
+y2=[]
+plt.figure()
+plt.title('M')
+for i in B.Mwcat[:]:
+    y2.append(np.dot(np.array(i),xxL))
+    
+    plt.plot(x.T,y2[-1].T)
+ 
+
+y3=[]
+plt.figure()
+plt.title('M_p')
+for i in B.Mpwcat[:]:
+    y3.append(np.dot(np.array(i),xx))
+    
+    plt.plot(x.T,y3[-1].T)
+
+
+plt.figure()
+plt.plot(x.T,y2[-1].T,label='M long',color='k')
+plt.plot(x.T,y3[-1].T,label='Mp long',color='k',linestyle=':')
+plt.plot(x.T,y[-1].T,label='G short',color='C0')
+plt.plot(B.catL[:,1],B.catL[:,0],linestyle='None',marker='.',color='k',label='long')
+plt.plot(B.cat[:,1],B.cat[:,0],linestyle='None',marker='.',color='C0',label='short')
+plt.legend()
+
+mm=np.array(B.Mcat)
+mm2=np.array(B.Gcat)
+mm3=np.array(B.Mpcat)
+plt.figure()
+plt.plot(mm, label='M')
+plt.plot(mm3, label='M_p')
+plt.plot(mm2,label='G')
+# plt.title('M')
+plt.legend()
+
+pp=np.array(B.lookback).T
+plt.figure()
+plt.plot(pp[0],label='PID')
+plt.plot(pp[1],label='M')
+plt.plot(pp[2],label='RL')
+plt.legend()
+plt.figure()
+plt.plot(Bcatlong)
+plt.title('beta')
+
+
+
+
+# plt.figure()
+# plt.plot(x.T,y[-1].T)
+# plt.plot(B.catL[:,1],B.catL[:,0],linestyle='None',marker='.',color='k')
+# plt.plot(B.cat[:,1],B.cat[:,0],linestyle='None',marker='.',color='C0')
+
+# %% PRINT Results
+
+print(np.mean(np.abs(ecatlong)))
+print('BE',B.BE)
+print('')
+# print(np.mean(np.abs(ecat[100:])))
+
+# %%
+
+mds=50
+tRLPID2,tRLPID_L2,tRLPID_U2=gen_median(reps,mds)
+
+plt.figure()
+# plt.fill_between(range(1000),tRLPID_L2,tRLPID_U2,color='C2',alpha=0.1)
+plt.plot(reps,marker='.',linestyle='None',color='C2',alpha=.5,markersize=1)
+plt.plot(tRLPID2, label='RL-PID2',color='C2')
+plt.grid()
+
+# fig, ax = plt.subplots(figsize=(15*cm, 13*cm))
+# ax.fill_between(range(1000),tRL_L,tRL_U,color='C1',alpha=0.1)
+# ax.fill_between(range(1000),tRLPID_L,tRLPID_U,color='C0',alpha=0.1)
+# ax.fill_between(range(1000),tRLPID_L2,tRLPID_U2,color='C2',alpha=0.1)
+# ax.plot(t1k_RL.rcatep,marker='.',linestyle='None',color='C1',alpha=.5,markersize=1)
+# ax.plot(t1k_RLPID.rcatep,marker='.',linestyle='None',color='C0',alpha=.5,markersize=1)
+# ax.plot(reps,marker='.',linestyle='None',color='C2',alpha=.5,markersize=1)
+# ax.plot(tRL, label='RL',color='C1')
+# ax.plot(tRLPID, label='RL-PID',color='C0')
+# ax.plot(tRLPID2, label='RL-PID2',color='C2')
+# ax.set_title('Learning Rate',fontproperties=font)
+# ax.set_ylabel(r'$\bar{R}$',fontproperties=font)
+# ax.set_xlabel('Episode',fontproperties=font)
+# ax.legend(prop=fontL)
+# ax.grid()
+# ax.tick_params(labelsize=tsz)
+# for tick in ax.get_xticklabels():
+#     tick.set_fontname("Times New Roman")
+# for tick in ax.get_yticklabels():
+#     tick.set_fontname("Times New Roman")
+
+# %% save data other?
+# buffdat=[DDPG.RB.state_buffer, DDPG.RB.action_buffer, DDPG.RB.reward_buffer, DDPG.RB.next_state_buffer]
+# bufferset='Buff500ep_VdV.pkl'
+# with open(bufferset,'wb') as pkl_wb_obj:
+#     pickle.dump(buffdat,pkl_wb_obj)
+
+# %% print NN param
+
+# for name, param in Agent.actor.named_parameters():
+#     if param.requires_grad:
+#         print( name, param.data)
+
+# %% save data?
+# n_states=1
+# n_actions=1
+# wd=0
+# bs=128
+# # (self, n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, w_decay=0):
+# DDPG=DDPGagent(n_states,n_actions, 1e-4, 1e-3, 0.99, 1e-2, 100000, bs, wd)
+
+# bfile='Buff500ep_VdV.pkl'
+# with open(bfile, "rb") as pkl_rb_obj:
+#     data = pickle.load(pkl_rb_obj)
+
+# DDPG.RB.state_buffer=data[0]
+# DDPG.RB.action_buffer=data[1]
+# DDPG.RB.reward_buffer=data[2]
+# DDPG.RB.next_state_buffer=data[3]
+# DDPG.RB.buffer_counter=len(data[0])
+
+
+# prac_epmax=6000
+# tstart=time.time()
+# for ep in range(prac_epmax):
+#     print('--------------')
+#     print(ep/prac_epmax)
+#     print('--------------')
+
+#     DDPG.update()
+
+# tend2=time.time()
+# print(tend2-tstart)
+
+# closs=DDPG.c_L
+# ploss=DDPG.p_L
+
+
+# plt.figure()
+# plt.plot(closs)
+# plt.title('closs')
+# plt.figure()
+# plt.plot(ploss)
+# plt.title('ploss')
+
+
+# %%  SAVE NN
+# G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod
+# G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod
+
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic_target2')
+
+# RL trad; offset G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic_target2')
+
+
+
+# new beta function; 121223; 1000 episodes; mid PID
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic_target2')
+
+# new beta good PID;G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic_target2')
+
+
+
+# torch.save(Agent.actor,path_a)
+# torch.save(Agent.actor_target,path_at)
+# torch.save(Agent.critic1,path_c1)
+# torch.save(Agent.critic_target1,path_ct1)
+# torch.save(Agent.critic2,path_c2)
+# torch.save(Agent.critic_target2,path_ct2)
+
+
+# %% print slice 1
+
+start=20*tend
+end=30*tend
+
+# start=-10*tend
+# end=-1
+
+# start=-30*60
+# end=start+20*60
+
+# start=0
+# end=10*tend
+
+
+plt.figure()
+plt.plot(ycont[start:end])
+plt.plot(spp[start:end],linestyle=':')
+plt.title('continuous state START')
+
+plt.figure()
+plt.plot(acont[start:end])
+plt.title('continuous action START')
+
+plt.figure()
+plt.plot(danormcon[start:end], label='RL')
+plt.plot(danormcon2[start:end], label='PID')
+plt.plot(danormcon3[start:end], label='act')
+plt.plot(danormcon4[start:end], label='act w Noise')
+plt.legend()
+plt.title('dA actions START')
+
+plt.figure()
+plt.plot(pp[0][start:end],label='PID')
+plt.plot(pp[1][start:end],label='M')
+plt.plot(pp[2][start:end],label='RL')
+plt.legend()
+
+plt.figure()
+plt.plot(Bcatlong[start:end])
+plt.title('beta START')
+plt.ylim([-0.1,1.1])
+
+# plt.figure()
+# plt.plot(np.array(danormcon3[start:end])-np.array(danormcon4[start:end]))
+
+plt.figure()
+plt.plot(ecatlong[start:end])
+plt.title('error START')
+
+print(np.mean(np.abs(ecatlong[start:end])))
+
+
+# %% print slice 2
+start2=-10*tend
+end2=-1
+
+plt.figure()
+plt.plot(ycont[start2:end2])
+plt.plot(spp[start2:end2],linestyle=':')
+plt.title('continuous state END')
+
+plt.figure()
+plt.plot(acont[start2:end2])
+plt.title('continuous action END')
+
+plt.figure()
+plt.plot(danormcon[start2:end2], label='RL')
+plt.plot(danormcon2[start2:end2], label='PID')
+plt.plot(danormcon3[start2:end2], label='act')
+plt.plot(danormcon4[start2:end2], label='act w Noise')
+plt.legend()
+plt.title('dA actions END')
+
+plt.figure()
+plt.plot(pp[0][start2:end2],label='PID')
+plt.plot(pp[1][start2:end2],label='M')
+plt.plot(pp[2][start2:end2],label='RL')
+plt.legend()
+
+plt.figure()
+plt.plot(Bcatlong[start2:end2])
+plt.title('beta END')
+plt.ylim([-0.1,1.1])
+
+# plt.figure()
+# plt.plot(np.array(danormcon3[start:end])-np.array(danormcon4[start:end]))
+
+plt.figure()
+plt.plot(ecatlong[start2:end2])
+plt.title('error END')
+
+print(np.mean(np.abs(ecatlong[start2:end2])))
+
+# %% Combine
+Bb=[]
+mds=90
+for i in range(len(Bcatlong[start:end])):
+    if i<mds:
+        Bb.append([np.median(np.abs(Bcatlong[start:end][0:i])), np.median(np.abs(Bcatlong[start2:end2][0:i]))] )
+    else:
+        Bb.append([np.median(Bcatlong[start:end][i-mds:i]), np.median(Bcatlong[start2:end2][i-mds:i])])
+
+
+Ee=[]
+# mds=25
+# for i in range(len(ecatlong[start:end])):
+#     if i<mds:
+#         Ee.append([np.median(-np.abs(ecatlong[start:end][0:i])), np.median(-np.abs(ecatlong[start2:end2][0:i]))] )
+#     else:
+#         Ee.append([np.median(-np.abs(ecatlong[start:end][i-mds:i])), np.median(-np.abs(ecatlong[start2:end2][i-mds:i]))])
+
+for i in range(len(ecatlong[start:end])):
+    if i<mds:
+        Ee.append([np.mean(-np.abs(ecatlong[start:end][0:i])), np.mean(-np.abs(ecatlong[start2:end2][0:i]))] )
+    else:
+        Ee.append([np.mean(-np.abs(ecatlong[start:end][i-mds:i])), np.mean(-np.abs(ecatlong[start2:end2][i-mds:i]))])
+
+
+Bb_n=np.array(Bb)
+Ee_n=np.array(Ee)
+
+plt.figure()
+plt.plot(Bcatlong[start:end],label='Start',color='C0')
+plt.plot(Bcatlong[start2:end2],label='End', color='C1')
+# plt.plot(Bb_n[:,0],label='Start Median', color='C0',linestyle=':')
+# plt.plot(Bb_n[:,1],label='End Median',color='C1',linestyle=':')
+plt.legend()
+plt.title('Beta')
+plt.ylim([-0.1,1.1])
+
+plt.figure()
+# plt.plot(-np.abs(ecatlong[start:end]),label='Start', color='C0')
+# plt.plot(-np.abs(ecatlong[start2:end2]),label='End', color='C1')
+plt.plot(Ee_n[:,0],label='Start Median', color='C0',linestyle=':')
+plt.plot(Ee_n[:,1],label='End Median',color='C1',linestyle=':')
+plt.axhline(y=-0.00637,linestyle='--',color='k',label='Good PID')
+plt.axhline(y=-0.069955,linestyle='-.',color='k',label='Mid PID')
+plt.legend()
+plt.title('Error')
+
+plt.figure()
+plt.plot(-np.abs(ecatlong[start:end]),label='Start', color='C0')
+plt.plot(-np.abs(ecatlong[start2:end2]),label='End', color='C1')
+# plt.plot(Ee_n[:,0],label='Start Median', color='C0',linestyle=':')
+# plt.plot(Ee_n[:,1],label='End Median',color='C1',linestyle=':')
+plt.legend()
+plt.title('Error')
+
+
+# %% median error and beta
+
+ccc=[]
+mds=25
+for i in range(len(Bcatlong)):
+    if i<mds:
+        ccc.append(np.median(Bcatlong[0:i]))
+    else:
+        ccc.append(np.median(Bcatlong[i-mds:i]))
+
+plt.figure()
+plt.plot(Bcatlong[:])
+plt.plot(ccc)
+plt.title('beta')
+
+ccc=[]
+# mds=25
+for i in range(len(ecatlong)):
+    if i<mds:
+        ccc.append(np.median(ecatlong[0:i]))
+    else:
+        ccc.append(np.median(ecatlong[i-mds:i]))
+
+
+plt.figure()
+plt.plot(ecatlong[:])
+plt.plot(ccc)
+# plt.ylim([-0.05,0.05])
+# %% Test RUN
+mds=90
+Ee=[]
+for i in range(len(ecatlong[:])):
+    if i<mds:
+        Ee.append(np.mean(-np.abs(ecatlong[:][0:i])))
+    else:
+        Ee.append(np.mean(-np.abs(ecatlong[:][i-mds:i])))
+Ee_n=np.array(Ee)
+plt.figure()
+# plt.plot(-np.abs(ecatlong[:]),label='Start', color='C0')
+# plt.plot(-np.abs(ecatlong[start2:end2]),label='End', color='C1')
+plt.plot(Ee_n[:],label='Start Median', color='C0',linestyle=':')
+plt.axhline(y=-0.00637,linestyle='--',color='k',label='Good PID')
+plt.axhline(y=-0.069955,linestyle='-.',color='k',label='Mid PID')
+plt.legend()
+plt.title('Error')
+
+print(np.mean(-np.abs(ecatlong)))
+
+
+# %%  PRint PID
+print(' ')
+print('PID ti:',pid1.ti)
+print(' -------KEY-------- ')
+print('Good PID: 0.05')
+print('Mid PID: 2.5')
+print('Bad PID: 1e6')
+
+
+# %% Save Data New
+save_data=1
+# For SOC
+# datfile=[tt, catt, cattsp, rcatep, rcatlong, bcatep, bcat, bcatlong, time_set_tick, time_final, epmax, noise_cat, action, rla, pla, reset, PoorR_Log]
+# setfile=[on_noise, on_reset, on_bep, bepref, save_nn, mode_sw, sp_sw, petsc_on, var_solve]
+
+# For TD3 CSTR
+datfile=[range(len(ycont)), ycont, spp, reps, ecatlong, beps, Bcat, Bcatlong, [], tend, epmax, neps, acont, danormcon, danormcon2]
+# betafile=[[start,end],[start2,end2],Bcatlong,ecatlong,pp,[B.BE,B.cap,B.capL,B.time,B.timeL,B.phi,B.phi2],B.cat,B.catL,[B.Wcat,B.Mwcat,B.Mpwcat],[B.Gcat,B.Mcat,B.Mpcat]]
+
+# FOR Sarsa CSTR
+# datfile=[range(len(ycat)), ycat, spp, reps, rcat, bavg, Bcat, Bcat, [], tend, epmax, neps, acat, [], []]
+# betafile=[[],[],Bcat,rcat,pp,[B.BE,B.cap,B.capL,B.time,B.timeL,B.phi,B.phi2],B.cat,B.catL,[B.Wcat,B.Mwcat,B.Mpwcat],[B.Gcat,B.Mcat,B.Mpcat]]
+
+# G:\My Drive\Python Scripts\interactive window\CSTR
+#nam_con="CSTR_TD3_1000ep_RLPID_121223"
+# nam_con="CSTR_TD3_1000ep_RLPIDg_121823"
+
+
+# RL-PID setpoint swaps TD3
+# nam_con="CSTR_TD3_1ep_sp_G_121223"
+# nam_con="CSTR_TD3_1ep_sp_M_121223"
+# nam_con="CSTR_TD3_1ep_sp_B_121223"
+
+# RL-PID Dist Reject swaps TD3
+# nam_con="CSTR_TD3_1ep_dr_G_121223"
+# nam_con="CSTR_TD3_1ep_dr_M_121223"
+# nam_con="CSTR_TD3_1ep_dr_B_121223"
+
+# PID (or RL) only setpoint swap TD3
+# nam_con="CSTR_TD3_1ep_sp_PID_G_121223"
+# nam_con="CSTR_TD3_1ep_sp_PID_M_121223"
+# nam_con="CSTR_TD3_1ep_sp_PID_B_121223"
+# nam_con="CSTR_TD3_1ep_sp_RL_121223"
+
+# PID (or RL) only dist reject swap TD3
+# nam_con="CSTR_TD3_1ep_dr_PID_G_121223"
+# nam_con="CSTR_TD3_1ep_dr_PID_M_121223"
+# nam_con="CSTR_TD3_1ep_dr_PID_B_121223"
+# nam_con="CSTR_TD3_1ep_dr_RL_121223"
+
+# RL-PID setpoint swaps SARSA
+# nam_con="CSTR_SARSA_1ep_sp_G_121223"
+# nam_con="CSTR_SARSA_1ep_sp_M_121223"
+# nam_con="CSTR_SARSA_1ep_sp_B_121223"
+
+# RL-PID Dist Reject swaps SARSA
+# nam_con="CSTR_SARSA_1ep_dr_G_121223"
+# nam_con="CSTR_SARSA_1ep_dr_M_121223"
+# nam_con="CSTR_SARSA_1ep_dr_B_121223"
+
+# PID (or RL) only setpoint swap SARSA
+# nam_con="CSTR_SARSA_1ep_sp_PID_G_121223"
+# nam_con="CSTR_SARSA_1ep_sp_PID_M_121223"
+# nam_con="CSTR_SARSA_1ep_sp_PID_B_121223"
+# nam_con="CSTR_SARSA_1ep_sp_RL_121223"
+
+# PID (or RL) only dist reject swap SARSA
+# nam_con="CSTR_SARSA_1ep_dr_PID_G_121223"
+# nam_con="CSTR_SARSA_1ep_dr_PID_M_121223"
+# nam_con="CSTR_SARSA_1ep_dr_PID_B_121223"
+# nam_con="CSTR_SARSA_1ep_dr_RL_121223"
+
+
+# trad train RL offset one 12182023
+# nam_con="CSTR_TD3_1000ep_RL_121823"
+
+
+# Model comparison Good RL-PID and Mid RL-PID
+# nam_con="CSTR_TD3_1ep_sp_RLgood_010524"
+# nam_con="CSTR_TD3_1ep_sp_RLmid_010524"
+# nam_con="CSTR_TD3_1ep_dr_RLgood_010524"
+# nam_con="CSTR_TD3_1ep_dr_RLmid_010524"
+
+
+
+# if save_data==1:
+#     pfile=(r"G:\My Drive\Python Scripts\interactive window\CSTR\datfile_"+nam_con+".pkl")
+#     with open(pfile, "wb") as pkl_wb_obj:
+#         pickle.dump(datfile,pkl_wb_obj)
+
+#     # pfile2=(r"G:\My Drive\Python Scripts\interactive window\setfile_"+nam_con+".pkl")
+#     # with open(pfile2, "wb") as pkl_wb_obj:
+#     #     pickle.dump(setfile,pkl_wb_obj)
+
+#     pfile3=(r"G:\My Drive\Python Scripts\interactive window\CSTR\betafile_"+nam_con+".pkl")
+#     with open(pfile3, "wb") as pkl_wb_obj:
+        # pickle.dump(betafile,pkl_wb_obj)
+
+if save_data==1:
+    pfile=(r"G:\My Drive\Python Scripts\interactive window\CSTR\noBeta\datfile_"+nam_con+".pkl")
+    with open(pfile, "wb") as pkl_wb_obj:
+        pickle.dump(datfile,pkl_wb_obj)
+
+    
+# %%
+
+
+# trad trained TD3
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod\critic_target2')
+
+# new beta function; 121223; 1000 episodes;
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic_target2')
+
+
+# RL trad; offset G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_mod_offset\critic_target2')
+
+
+# # new beta good PID;G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPIDg_mod\critic_target2')
+
+# t11=TD3(n_states,n_actions, 1e-4, 1e-3, 0.99, 1e-2, 100000, bs, wd, 2)
+
+# t11.actor= torch.load(path_a)
+# t11.actor_target= torch.load(path_at)
+# t11.critic1= torch.load(path_c1)
+# t11.critic_target1= torch.load(path_ct1)
+# t11.critic2= torch.load(path_c2)
+# t11.critic_target2= torch.load(path_ct2)
+
+# for name, param in t11.actor.named_parameters():
+#     if param.requires_grad:
+#         print( name, param.data)
+
+# # path_a=(r'C:\Users\dbeah\soec_idaes\soec-control-main\models\actor')
+# # Agent.actor= torch.load(path_a)
+# # for name, param in Agent.actor.named_parameters():
+# #     if param.requires_grad:
+# #         print( name, param.data)
+        
+
+# path_a=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\actor')
+# path_at=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\actor_target')
+# path_c1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic1')
+# path_ct1=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic_target1')
+# path_c2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic2')
+# path_ct2=(r'G:\My Drive\Python Scripts\RL_PID_CSTR_VS\TD3_CSTR_RLPID_mod\critic_target2')
+        
+# t11=TD3(n_states,n_actions, 1e-4, 1e-3, 0.99, 1e-2, 100000, bs, wd, 2)
+
+# t11.actor= torch.load(path_a)
+# t11.actor_target= torch.load(path_at)
+# t11.critic1= torch.load(path_c1)
+# t11.critic_target1= torch.load(path_ct1)
+# t11.critic2= torch.load(path_c2)
+# t11.critic_target2= torch.load(path_ct2)
+
+# for name, param in t11.actor.named_parameters():
+#     if param.requires_grad:
+#         print( name, param.data)
