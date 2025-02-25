@@ -11,7 +11,7 @@ https://www.sciencedirect.com/science/article/abs/pii/S0098135424002448
 
 This code is probably the most disorganized given the number of situations and circumstances I needed to model. For that, I apologize. It uses a custom virtual environment based on the IDAES package as well as pyomo and pytorch. There are two files, one containing simulation of a flow sheet of a solid oxide fuel cell (SOFC), and the other of a continuous stirred tank reactor (CSTR). In both cases, I needed to simulate conventional control, reinforcement learning control, and dynamic modelling of the system under a number of different disturbances and scenarios. The SOFC model is much more complicated given the size and complexity of the model. I did not develop that model, but it can be found in the IDAES repo if you would like to look into it. The CSTR model is a simple non-linear Van des Vous reactor, which only requires the pyomo package and not the IDAES package.
 
-IDAES REPO:https://github.com/DanBeahr/idaes-pse.git
+IDAES REPO:https://github.com/IDAES/idaes-pse.git
 
 ## AdvisorAlg
 The folder AdvisorAlg contains some of my most recent work. This uses state space models of a selective catalytic reduction unit as opposed to a pyomo model. Here you should be able to actually simulate without a custom virtual environment with IDAES downloaded. However, the functions that contain elements of gaussian mixture models have not quite been worked out yet, so I enourage disabling the special_train and special_exp options if you wish to try see the code in action for training.
