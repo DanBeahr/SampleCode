@@ -552,67 +552,6 @@ class OUActionNoise:   #ornstein uhlenbock process for exploration nosie
             self.x_prev = np.zeros_like(self.mean)
 
 
-class mixer:    #dont use
-    def __init__(self):
-        # Agent=agent_
-        self.clf=[]
-        self.data=[]
-
-
-        print('done')
-    def generate(self, comp=6):
-
-    
-        sb=Agent.RB.state_buffer
-        ab=Agent.RB.action_buffer
-        rb=Agent.RB.reward_buffer
-        ssb=Agent.RB.next_state_buffer
-
-        # sb2=np.concatenate(sb).squeeze(1)
-        # ab2=np.concatenate(ab).squeeze(1)
-        # rb2=np.concatenate(rb).squeeze(1)
-        # ssb2=np.concatenate(ssb).squeeze(1)
-
-        self.data=np.concatenate((sb,ab,rb,ssb),1)
-
-        data2=self.data[:,0:Agent.num_states+Agent.num_actions]
-        self.clf = mixture.GaussianMixture(n_components=comp, covariance_type="full")
-        self.clf.fit(data2)
-
-    def predict_set(self,x,a):
-        label=self.clf.predict(np.concatenate((x.T,a),1))
-        prb=self.clf.predict_proba(np.concatenate((x.T,a),1))
-
-        nb=self.data[self.clf.predict(self.data[:,0:Agent.num_states+Agent.num_actions])==label]
-
-        state_buffer=nb[:,0:Agent.num_states]
-        action_buffer=nb[:,Agent.num_states:Agent.num_states+Agent.num_actions]
-        reward_buffer=nb[:,Agent.num_states+Agent.num_actions:Agent.num_states+Agent.num_actions+1]
-        next_state_buffer= nb[:,Agent.num_states+Agent.num_actions+1:-1]
-
-        states=[]
-        actions=[]
-        rewards=[]
-        next_states=[]
-        
-        
-        if Agent.RB.buffer_counter < Agent.RB.batch_size/2:
-            states=state_buffer
-            actions=action_buffer
-            rewards=reward_buffer
-            next_states=next_state_buffer
-        else:
-            select=random.sample(range(len(Agent.RB.state_buffer)),Agent.RB.batch_size/2)
-            
-            for i in select:
-                states.append(state_buffer[i])
-                actions.append(action_buffer[i])
-                rewards.append(reward_buffer[i])
-                next_states.append(next_state_buffer[i])
-        pbL= [states, actions, rewards, next_states]
-        # return states, actions, rewards, next_states
-        return pbL
-
 
 # %%  BUffer
 
@@ -1481,64 +1420,6 @@ class DDPGagent_m2:   #ddpg version 3 modified for gmm update and exp
             target_param.data.copy_(param.data * self.tau + target_param.data * (1.0 - self.tau))
 
 
-# %% select best groups
-
-# def pred_exp(self,x):
-#         X=np.tile(x.T,(21,1))
-#         A=np.expand_dims(np.linspace(-1,1,21),1)
-#         prb=self.exp.predict_proba(np.concatenate((X,A),1))
-
-#         thresh=0.9
-
-#         gg=[]
-#         grp=[]
-#         pick=[]
-#         pick2=[]
-#         pick3=[]
-#         a=np.array(self.tempR)
-#         a=a[a[:, 1].argsort()]
-#         if np.where(prb[:,int(a[-1,0])]>0.9)[0].size>0:
-#             for i in np.where(prb[:,int(a[-1,0])]>0.9)[0]:
-#                 pick.append([(i,int(a[-1,0])),prb[i,int(a[-1,0])]])
-
-#         if np.where((prb<thresh) & (prb>0.1))[0].size>0:
-#             nva=False
-            
-
-
-#             for i in np.where((prb<thresh) & (prb>0.1))[0]:
-               
-
-
-#                 z=prb[i,:]
-#                 z=np.delete(z,np.where(prb[i,:]==max(prb[i,:])))
-#                 gg.append(prb[i,:])
-#                 grp.append([(i,np.where(prb[i,:]==max(prb[i,:]))[0].item()),max(prb[i,:]),(i,np.where(prb[i,:]==max(z))[0].item()),max(z)])
-#             for i in grp:
-#                 if i[0][1]==a[-1,0]:
-#                     pick.append(i)
-#                 elif i[0][1]==a[-2,0]:
-#                     pick2.append(i)
-#                 elif i[0][1]==a[-3,0]:
-#                     pick3.append(i)
-
-#             if len(pick)>0:
-#                 indx=random.choice(pick)
-#             elif len(pick2)>0:
-#                 indx=random.choice(pick2)
-#             elif len(pick3)>0:
-#                 indx=random.choice(pick3)
-#             else:
-#                 nva=True
-#                 action=[]
-#             if not nva:
-#                 action=A[indx[0][0]]
-#                 print(indx)
-#         else:
-#             nva=True
-#             action=[]
-#         return nva, action
-
 
 
 
@@ -1828,10 +1709,7 @@ bs=128
 n_states=2
 n_actions=1
 Agent=DDPGagent_m2(n_states,n_actions, 1e-4, 1e-3, 0.99, 0.01, 100000, bs, wd)   #reward rank
-# Agent=DDPGagent_m(n_states,n_actions, 1e-4, 1e-3, 0.99, 0.01, 100000, bs, wd)   #test learn
-# Agent=DDPGagent_m(n_states,n_actions, 1e-4, 3e-4, 0.99, 0.01, 100000, bs, wd)   #deliberate learn bad good
-# Agent=DDPGagent(n_states,n_actions, 1e-4, 3e-4, 0.99, 0.01, 100000, bs, wd)   #deliberate bad
-# Agent=DDPGagent(n_states,n_actions, 1e-4, 1e-3, 0.99, 0.01, 100000, bs, wd)  #normal
+
 # (n_states=1, n_actions=1,  actor_learning_rate=1e-4, critic_learning_rate=1e-3, gamma=0.99, tau=1e-2, buffer_capacity=100000, batch_size=64, w_decay=0):)
 
 
@@ -1882,10 +1760,6 @@ save_loss=False   ###############################################
 # save_loss=False
 # special_train=False
 # special_exp=False
-
-
-
-
 
 # decay loop
 # epmax=100
@@ -2499,131 +2373,33 @@ if save_data:
 
 # %%Open buffer for load data testing
 
-import matplotlib.pyplot as plt
-import numpy as np
-from matplotlib.colors import LogNorm
-
-from sklearn import mixture
-
-# nam_con="ep_100_12202024_siso"
-# nam_con="ep_1000_12202024_siso"
-# pfile=(r"G:\My Drive\Python Scripts\conf_set\data\buffile_"+nam_con+".pkl")
-# with open(pfile, "rb") as pkl_rb_obj:
-#         buffile = pickle.load(pkl_rb_obj)  
-
-
-# data=buffile
-
-# sb=Agent.RB.state_buffer
-# ab=Agent.RB.action_buffer
-# rb=Agent.RB.reward_buffer
-# ssb=Agent.RB.next_state_buffer
-
-
-
-# sb2=np.concatenate(sb).squeeze(1)
-# ab2=np.concatenate(ab).squeeze(1)
-# rb2=np.concatenate(rb).squeeze(1)
-# ssb2=np.concatenate(ssb).squeeze(1)
-
-# data=np.concatenate((sb2,ab2,rb2,ssb2),1)
-# # data=np.concatenate((sb2,ab2,rb2),1)
-
-# %% sample from training
-
-# data2=data[:,0:3]
-# clf = mixture.GaussianMixture(n_components=9, covariance_type="full")
-# clf.fit(data2)
-# # clf.fit(data[:,0:2])
-
-clf2=Agent.RB.exp
-data2=Agent.RB.data[:,0:3]
-data=Agent.RB.data
-
-# clf=mixture.GaussianMixture(n_components=7, covariance_type="full")
-# clf.fit(data2)
-
-# 0,1 state   2 action    3 reward
-
-# x = np.linspace(-1, 1)
-# y = np.linspace(-1, 1)
-# r = np.linspace(0, 2)
-# X, Y, R = np.meshgrid(x, y, r)
-# # XX = np.array([X.ravel(), Y.ravel(), R.ravel(), X.ravel()]).T
-# XX = np.array([X.ravel(), Y.ravel(), R.ravel()]).T
-# Z = -clf.score_samples(XX)
-# Z = Z.reshape(X.shape)
-
-# CS = plt.contour(
-#     X, Y, Z[:,:,0], norm=LogNorm(vmin=1.0, vmax=1000.0), levels=np.logspace(0, 3, 10)
-# )
-# CB = plt.colorbar(CS, shrink=0.8, extend="both")
-# plt.scatter(data[:, 0], data[:, 1], 0.8)
-
-# plt.title("Negative log-likelihood predicted by a GMM")
-# plt.axis("tight")
-# plt.show()
-# colors=["blue","orange","green","red","purple","black","yellow","cyan","grey"]
-colors=["blue","orange","green","red","purple","black","yellow"]
-plt.figure()
-plt.xlabel('state')
-plt.ylabel('action')
-tempR=[]
-tempa=[]
-for i, color in enumerate(colors):
-    # plt.plot()
-    dsub = data[clf.predict(data2) == i]
-    plt.scatter(dsub[:, 0], dsub[:, 3], color=color, marker="x")
-    tempR.append([color,np.mean(dsub[:,3]),dsub[:,3]])
-    tempa.append([color,np.mean(dsub[:,2]),dsub[:,2]])
-    print(color)
-    print(np.mean(dsub[:,3]))
-    print(np.std(dsub[:,3]))
-    print('--------------------------------------------')
-    
-# %%
-
-# f=np.histogram(temp[0][2])
-for i,k in enumerate(tempR):
-    # print(i)
-    # print(k)
-    plt.figure()
-    plt.hist(k[2],label=k[0],color=k[0])
-    plt.legend()
-# %%
-for i,k in enumerate(tempa):
-    # print(i)
-    # print(k)
-    plt.figure()
-    plt.hist(k[2],label=k[0],color=k[0])
-    plt.legend()
-# %% Reset
-# X, Y, R = np.meshgrid(x, y, r)
-del GR
-del GnR
 # %% Start Here for test plotting
-nc=8
-end=12000
-data=Agent.RB.data
-data2=Agent.RB.data[:,0:3] #no rewards
-data2_full=Agent.RB.data[:,0:3] #no rewards
-data3=Agent.RB.data[:,0:4]  #rewards
-data3_full=Agent.RB.data[:,0:4]  #rewards
-GnR=mixture.GaussianMixture(n_components=nc, covariance_type="full")
-GnR.fit(data2)
-# GR=mixture.GaussianMixture(n_components=6, covariance_type="tied")
-GR=mixture.BayesianGaussianMixture(n_components=6, covariance_type="tied", max_iter=1000 ) #init_params="random"
-GR.fit(data3)
-# full tied speherical diag
+# nc=8
+# end=12000
+# data=Agent.RB.data
+# data2=Agent.RB.data[:,0:3] #no rewards
+# data2_full=Agent.RB.data[:,0:3] #no rewards
+# data3=Agent.RB.data[:,0:4]  #rewards
+# data3_full=Agent.RB.data[:,0:4]  #rewards
+# GnR=mixture.GaussianMixture(n_components=nc, covariance_type="full")
+# GnR.fit(data2)
+# # GR=mixture.GaussianMixture(n_components=6, covariance_type="tied")
+# GR=mixture.BayesianGaussianMixture(n_components=6, covariance_type="tied", max_iter=1000 ) #init_params="random"
+# GR.fit(data3)
+# # full tied speherical diag
 
 # %%  Start Here for test plotting of trained data
-data=Agent.RB.data
-data2=Agent.RB.data[:,0:3] #no rewards
-data2_full=Agent.RB.data[:,0:3] #no rewards
-data3=Agent.RB.data[:,0:4]  #rewards
-data3_full=Agent.RB.data[:,0:4]  #rewards
-GnR=Agent.RB.exp
-GR=Agent.RB.clf
+if special_exp or special_train:
+    data=Agent.RB.data
+    data2=Agent.RB.data[:,0:3] #no rewards
+    data2_full=Agent.RB.data[:,0:3] #no rewards
+    data3=Agent.RB.data[:,0:4]  #rewards
+    data3_full=Agent.RB.data[:,0:4]  #rewards
+    GnR=Agent.RB.exp
+    GR=Agent.RB.clf
+else:
+    print("Unintialized GMM")
+
 
 # %%
 tempR=[]
